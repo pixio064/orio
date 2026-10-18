@@ -1,0 +1,6 @@
+{
+  "name": "PIXIO 1.1",
+  "description": "Smart Digital Wellbeing, Sessions Tracking, Daily Planner & Reminder Companion",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
