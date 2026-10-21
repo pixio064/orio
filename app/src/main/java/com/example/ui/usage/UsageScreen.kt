@@ -17,9 +17,6 @@ import androidx.compose.material.icons.filled.*
 import androidx.compose.material.icons.outlined.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
-import androidx.lifecycle.Lifecycle
-import androidx.lifecycle.LifecycleEventObserver
-import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -30,22 +27,27 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.ViewModel
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.viewModelScope
 import com.example.FocusTrackApp
 import com.example.data.local.entity.AppLimitEntity
 import com.example.ui.components.EmptyStateCard
+import com.example.ui.util.AppIcon
 import com.example.usage.AppUsageInfo
 import com.example.usage.DayUsageSummary
 import com.example.usage.UsageStatsHelper
 import com.example.usage.UsageTimelineEvent
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
-import java.text.SimpleDateFormat
 import java.util.*
 
 data class UsageUiState(
@@ -55,57 +57,72 @@ data class UsageUiState(
     val searchQuery: String = "",
     val selectedCategory: String = "All",
     val selectedTab: Int = 0, // 0: Apps & Limits, 1: Timeline
-    val isLoading: Boolean = true
+    val isLoading: Boolean = true,
+    val errorMessage: String? = null
 )
 
 class UsageViewModel : ViewModel() {
     private val _uiState = MutableStateFlow(UsageUiState())
     val uiState: StateFlow<UsageUiState> = _uiState.asStateFlow()
 
+    private var loadJob: Job? = null
+
     fun loadData(context: Context) {
-        viewModelScope.launch(Dispatchers.IO) {
-            val hasPermission = UsageStatsHelper.hasUsageStatsPermission(context)
-            val cal = Calendar.getInstance()
-            val summary = UsageStatsHelper.queryRealDayUsage(context, cal)
+        loadJob?.cancel()
+        loadJob = viewModelScope.launch(Dispatchers.IO) {
+            try {
+                _uiState.update { it.copy(isLoading = true, errorMessage = null) }
+                val hasPermission = UsageStatsHelper.hasUsageStatsPermission(context)
+                val cal = Calendar.getInstance()
+                val summary = UsageStatsHelper.queryRealDayUsage(context, cal)
 
-            val app = context.applicationContext as FocusTrackApp
-            val limitsList = app.database.appLimitDao().getAllLimits().first()
-            val map = limitsList.associateBy { it.packageName }
+                val app = context.applicationContext as FocusTrackApp
+                val limitsList = app.database.appLimitDao().getAllLimits().first()
+                val map = limitsList.associateBy { it.packageName }
 
-            _uiState.value = _uiState.value.copy(
-                hasPermission = hasPermission,
-                summary = summary,
-                limitsMap = map,
-                isLoading = false
-            )
+                _uiState.update {
+                    it.copy(
+                        hasPermission = hasPermission,
+                        summary = summary,
+                        limitsMap = map,
+                        isLoading = false
+                    )
+                }
+            } catch (e: Throwable) {
+                _uiState.update { it.copy(isLoading = false, errorMessage = e.message) }
+            }
         }
     }
 
     fun setSearchQuery(query: String) {
-        _uiState.value = _uiState.value.copy(searchQuery = query)
+        _uiState.update { it.copy(searchQuery = query) }
     }
 
     fun setSelectedCategory(cat: String) {
-        _uiState.value = _uiState.value.copy(selectedCategory = cat)
+        _uiState.update { it.copy(selectedCategory = cat) }
     }
 
     fun setSelectedTab(tab: Int) {
-        _uiState.value = _uiState.value.copy(selectedTab = tab)
+        _uiState.update { it.copy(selectedTab = tab) }
     }
 
     fun saveAppLimit(context: Context, appLimit: AppLimitEntity) {
         viewModelScope.launch(Dispatchers.IO) {
-            val app = context.applicationContext as FocusTrackApp
-            app.database.appLimitDao().insertOrUpdate(appLimit)
-            loadData(context)
+            try {
+                val app = context.applicationContext as FocusTrackApp
+                app.database.appLimitDao().insertOrUpdate(appLimit)
+                loadData(context)
+            } catch (_: Throwable) {}
         }
     }
 
     fun removeAppLimit(context: Context, packageName: String) {
         viewModelScope.launch(Dispatchers.IO) {
-            val app = context.applicationContext as FocusTrackApp
-            app.database.appLimitDao().deleteByPackage(packageName)
-            loadData(context)
+            try {
+                val app = context.applicationContext as FocusTrackApp
+                app.database.appLimitDao().deleteByPackage(packageName)
+                loadData(context)
+            } catch (_: Throwable) {}
         }
     }
 }
@@ -136,20 +153,17 @@ fun UsageScreen(
         }
     }
 
-    val categories = listOf("All", "Most Used", "Social", "Entertainment", "Productivity", "Education")
+    val allApps = uiState.summary?.appUsages ?: emptyList()
+    val categories = remember(allApps) {
+        listOf("All") + allApps.map { it.category }.distinct().filter { it.isNotBlank() }
+    }
 
-    val filteredApps = remember(uiState.summary, uiState.searchQuery, uiState.selectedCategory) {
-        val list = uiState.summary?.appUsages ?: emptyList()
-        list.filter { app ->
-            val matchesQuery = app.appName.contains(uiState.searchQuery, ignoreCase = true)
-            val matchesCat = when (uiState.selectedCategory) {
-                "All" -> true
-                "Most Used" -> true
-                else -> app.category.equals(uiState.selectedCategory, ignoreCase = true)
-            }
-            matchesQuery && matchesCat
-        }.let {
-            if (uiState.selectedCategory == "Most Used") it.sortedByDescending { a -> a.totalTimeInForegroundMs } else it
+    val filteredApps = remember(allApps, uiState.searchQuery, uiState.selectedCategory) {
+        allApps.filter { app ->
+            val matchesQuery = app.appName.contains(uiState.searchQuery, ignoreCase = true) ||
+                    app.packageName.contains(uiState.searchQuery, ignoreCase = true)
+            val matchesCategory = uiState.selectedCategory == "All" || app.category == uiState.selectedCategory
+            matchesQuery && matchesCategory
         }
     }
 
@@ -158,7 +172,7 @@ fun UsageScreen(
             TopAppBar(
                 title = {
                     Text(
-                        text = "App Usage & Limits",
+                        text = "App Usage & Screen Time",
                         style = MaterialTheme.typography.titleLarge,
                         fontWeight = FontWeight.Bold
                     )
@@ -166,28 +180,7 @@ fun UsageScreen(
                 navigationIcon = {
                     if (onBack != null) {
                         IconButton(onClick = onBack) {
-                            Icon(
-                                imageVector = Icons.AutoMirrored.Filled.ArrowBack,
-                                contentDescription = "Back"
-                            )
-                        }
-                    }
-                },
-                actions = {
-                    if (com.example.BuildConfig.DEBUG) {
-                        Surface(
-                            shape = RoundedCornerShape(8.dp),
-                            color = if (uiState.hasPermission) Color(0xFFDCFCE7) else Color(0xFFFEF3C7),
-                            border = BorderStroke(1.dp, if (uiState.hasPermission) Color(0xFF16A34A) else Color(0xFFD97706)),
-                            modifier = Modifier.padding(end = 8.dp)
-                        ) {
-                            Text(
-                                text = if (uiState.hasPermission) "Data: Real" else "Data: Need Perm",
-                                style = MaterialTheme.typography.labelSmall,
-                                fontWeight = FontWeight.Bold,
-                                color = if (uiState.hasPermission) Color(0xFF15803D) else Color(0xFFB45309),
-                                modifier = Modifier.padding(horizontal = 6.dp, vertical = 3.dp)
-                            )
+                            Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
                         }
                     }
                 },
@@ -213,15 +206,15 @@ fun UsageScreen(
                     selected = uiState.selectedTab == 0,
                     onClick = { viewModel.setSelectedTab(0) },
                     text = { Text("Apps & Limits") },
-                    icon = { Icon(Icons.Default.Apps, contentDescription = null) },
+                    icon = { Icon(Icons.Default.Apps, contentDescription = "Apps Tab") },
                     modifier = Modifier.testTag("tab_apps_limits")
                 )
                 Tab(
                     selected = uiState.selectedTab == 1,
                     onClick = { viewModel.setSelectedTab(1) },
-                    text = { Text("Usage Timeline") },
-                    icon = { Icon(Icons.Default.Timeline, contentDescription = null) },
-                    modifier = Modifier.testTag("tab_usage_timeline")
+                    text = { Text("Activity Timeline") },
+                    icon = { Icon(Icons.Default.Timeline, contentDescription = "Timeline Tab") },
+                    modifier = Modifier.testTag("tab_timeline")
                 )
             }
 
@@ -230,15 +223,16 @@ fun UsageScreen(
                 OutlinedTextField(
                     value = uiState.searchQuery,
                     onValueChange = { viewModel.setSearchQuery(it) },
-                    placeholder = { Text("Search apps...") },
-                    leadingIcon = { Icon(Icons.Default.Search, contentDescription = null) },
+                    placeholder = { Text("Search installed apps...") },
+                    leadingIcon = { Icon(Icons.Default.Search, contentDescription = "Search") },
                     trailingIcon = {
                         if (uiState.searchQuery.isNotEmpty()) {
                             IconButton(onClick = { viewModel.setSearchQuery("") }) {
-                                Icon(Icons.Default.Close, contentDescription = "Clear")
+                                Icon(Icons.Default.Clear, contentDescription = "Clear")
                             }
                         }
                     },
+                    singleLine = true,
                     shape = RoundedCornerShape(16.dp),
                     modifier = Modifier
                         .fillMaxWidth()
@@ -248,23 +242,23 @@ fun UsageScreen(
 
                 // Category Chips
                 LazyRow(
-                    contentPadding = PaddingValues(horizontal = 16.dp, vertical = 4.dp),
+                    contentPadding = PaddingValues(horizontal = 16.dp),
                     horizontalArrangement = Arrangement.spacedBy(8.dp),
-                    modifier = Modifier.fillMaxWidth()
+                    modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp)
                 ) {
                     items(categories) { cat ->
                         FilterChip(
                             selected = uiState.selectedCategory == cat,
                             onClick = { viewModel.setSelectedCategory(cat) },
                             label = { Text(cat) },
-                            shape = RoundedCornerShape(12.dp)
+                            shape = RoundedCornerShape(10.dp)
                         )
                     }
                 }
 
-                // Apps List
+                // App Usage Cards List
                 LazyColumn(
-                    contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 8.dp, bottom = 24.dp),
+                    contentPadding = PaddingValues(start = 16.dp, end = 16.dp, bottom = 80.dp),
                     verticalArrangement = Arrangement.spacedBy(10.dp),
                     modifier = Modifier.fillMaxSize()
                 ) {
@@ -272,12 +266,13 @@ fun UsageScreen(
                         item {
                             EmptyStateCard(
                                 title = "No Apps Found",
-                                description = "No application matches your current search or category filter.",
+                                description = if (uiState.hasPermission) "No app activity matches your search filter."
+                                else "Grant Usage Stats permission to view per-app active time.",
                                 icon = Icons.Outlined.SearchOff
                             )
                         }
                     } else {
-                        itemsIndexed(filteredApps, key = { index, appInfo -> "${appInfo.packageName}_$index" }) { _, appInfo ->
+                        items(filteredApps, key = { it.packageName }) { appInfo ->
                             val limit = uiState.limitsMap[appInfo.packageName]
                             AppUsageCard(
                                 app = appInfo,
@@ -289,24 +284,24 @@ fun UsageScreen(
                     }
                 }
             } else {
-                // Usage Timeline Tab
+                // Timeline Tab (with Screen On, Screen Off, Unlocks, and App events)
                 val timeline = uiState.summary?.timelineEvents ?: emptyList()
                 LazyColumn(
-                    contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 12.dp, bottom = 32.dp),
-                    verticalArrangement = Arrangement.spacedBy(10.dp),
+                    contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 8.dp, bottom = 80.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
                     modifier = Modifier.fillMaxSize()
                 ) {
                     if (timeline.isEmpty()) {
                         item {
                             EmptyStateCard(
-                                title = "No Timeline Events",
-                                description = "Real phone usage events will be reconstructed here as you use your device.",
-                                icon = Icons.Outlined.History
+                                title = "No Timeline Events Yet",
+                                description = "Unlocks, screen sessions, and app switches will appear here chronologically.",
+                                icon = Icons.Outlined.HourglassEmpty
                             )
                         }
                     } else {
-                        itemsIndexed(timeline, key = { index, event -> "${event.timestamp}_$index" }) { _, event ->
-                            TimelineEventCard(event = event)
+                        itemsIndexed(timeline) { index, event ->
+                            TimelineCard(event = event, isLast = index == timeline.lastIndex)
                         }
                     }
                 }
@@ -314,12 +309,13 @@ fun UsageScreen(
         }
     }
 
-    // App Limit Dialog
+    // App Limit Dialog with separate switches and editable warning threshold
     if (selectedAppForLimit != null) {
         val app = selectedAppForLimit!!
         val existingLimit = uiState.limitsMap[app.packageName]
         var limitMinutes by remember { mutableStateOf(existingLimit?.limitMinutes ?: 30) }
         var warningThreshold by remember { mutableStateOf(existingLimit?.warningThresholdPercent ?: 80) }
+        var notifyOnWarning by remember { mutableStateOf(existingLimit?.notifyOnWarning ?: true) }
         var notifyOnLimit by remember { mutableStateOf(existingLimit?.notifyOnLimit ?: true) }
 
         AlertDialog(
@@ -334,7 +330,7 @@ fun UsageScreen(
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
                     Text(
-                        text = "Set a daily usage threshold. You'll receive a heads-up pop-up when approaching and reaching this limit.",
+                        text = "Set a daily usage threshold. You'll receive pop-up alerts when approaching and reaching this limit.",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
@@ -345,7 +341,7 @@ fun UsageScreen(
                         horizontalArrangement = Arrangement.spacedBy(8.dp),
                         modifier = Modifier.fillMaxWidth()
                     ) {
-                        listOf(15, 30, 45, 60).forEach { mins ->
+                        listOf(15, 30, 45, 60, 90).forEach { mins ->
                             FilterChip(
                                 selected = limitMinutes == mins,
                                 onClick = { limitMinutes = mins },
@@ -364,15 +360,41 @@ fun UsageScreen(
                         steps = 34
                     )
 
-                    // 80% Warning Toggle
+                    // Editable Warning Threshold Slider
+                    val warnMinutes = (limitMinutes * warningThreshold / 100)
+                    Text("Warning Threshold: $warningThreshold% (${warnMinutes}m)", style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.SemiBold)
+                    Slider(
+                        value = warningThreshold.toFloat(),
+                        onValueChange = { warningThreshold = it.toInt() },
+                        valueRange = 50f..95f,
+                        steps = 8
+                    )
+
+                    // Switch 1: Warning Alert
                     Row(
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.SpaceBetween,
                         modifier = Modifier.fillMaxWidth()
                     ) {
-                        Column {
-                            Text("Warning at 80% ($warningThreshold%)", style = MaterialTheme.typography.bodyMedium)
-                            Text("Alert ${(limitMinutes * warningThreshold / 100)}m into limit", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text("Notify on Approaching ($warningThreshold%)", style = MaterialTheme.typography.bodyMedium)
+                            Text("Alerts once at $warnMinutes min into limit", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        }
+                        Switch(
+                            checked = notifyOnWarning,
+                            onCheckedChange = { notifyOnWarning = it }
+                        )
+                    }
+
+                    // Switch 2: Limit Reached Alert
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text("Notify at 100% Daily Limit", style = MaterialTheme.typography.bodyMedium)
+                            Text("Alerts once at full $limitMinutes min", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                         }
                         Switch(
                             checked = notifyOnLimit,
@@ -394,7 +416,7 @@ fun UsageScreen(
                                 isEnabled = true,
                                 category = app.category,
                                 notifyOnLimit = notifyOnLimit,
-                                notifyOnWarning = notifyOnLimit
+                                notifyOnWarning = notifyOnWarning
                             )
                         )
                         selectedAppForLimit = null
@@ -402,7 +424,7 @@ fun UsageScreen(
                     shape = RoundedCornerShape(12.dp),
                     modifier = Modifier.testTag("save_limit_btn")
                 ) {
-                    Text("Set Limit")
+                    Text("Save Limit")
                 }
             },
             dismissButton = {
@@ -450,20 +472,11 @@ fun AppUsageCard(
                 verticalAlignment = Alignment.CenterVertically,
                 modifier = Modifier.fillMaxWidth()
             ) {
-                Box(
-                    modifier = Modifier
-                        .size(46.dp)
-                        .clip(RoundedCornerShape(12.dp))
-                        .background(MaterialTheme.colorScheme.primaryContainer),
-                    contentAlignment = Alignment.Center
-                ) {
-                    Icon(
-                        imageVector = Icons.Default.Apps,
-                        contentDescription = null,
-                        tint = MaterialTheme.colorScheme.primary,
-                        modifier = Modifier.size(24.dp)
-                    )
-                }
+                AppIcon(
+                    packageName = app.packageName,
+                    size = 46.dp,
+                    contentDescription = app.appName
+                )
                 Spacer(modifier = Modifier.width(14.dp))
                 Column(modifier = Modifier.weight(1f)) {
                     Text(
@@ -519,60 +532,70 @@ fun AppUsageCard(
 }
 
 @Composable
-fun TimelineEventCard(event: UsageTimelineEvent) {
-    val timeFormatted = SimpleDateFormat("h:mm a", Locale.getDefault()).format(Date(event.timestamp))
-
-    val (icon, color) = when (event.eventType) {
-        "SCREEN_ON" -> Pair(Icons.Default.Visibility, MaterialTheme.colorScheme.primary)
-        "SCREEN_OFF" -> Pair(Icons.Default.VisibilityOff, MaterialTheme.colorScheme.outline)
-        "KEYGUARD_HIDDEN" -> Pair(Icons.Default.LockOpen, MaterialTheme.colorScheme.secondary)
-        "APP_FOREGROUND" -> Pair(Icons.Default.Launch, MaterialTheme.colorScheme.tertiary)
-        else -> Pair(Icons.Default.Spa, MaterialTheme.colorScheme.secondary)
-    }
-
-    Card(
-        shape = RoundedCornerShape(16.dp),
-        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
-        modifier = Modifier.fillMaxWidth()
+fun TimelineCard(
+    event: UsageTimelineEvent,
+    isLast: Boolean
+) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        verticalAlignment = Alignment.CenterVertically
     ) {
-        Row(
-            verticalAlignment = Alignment.CenterVertically,
-            modifier = Modifier.padding(14.dp)
+        val cal = Calendar.getInstance().apply { timeInMillis = event.timestamp }
+        val timeString = String.format("%02d:%02d", cal.get(Calendar.HOUR_OF_DAY), cal.get(Calendar.MINUTE))
+
+        Text(
+            text = timeString,
+            style = MaterialTheme.typography.labelSmall,
+            fontWeight = FontWeight.Bold,
+            color = MaterialTheme.colorScheme.primary,
+            modifier = Modifier.width(44.dp)
+        )
+
+        Spacer(modifier = Modifier.width(8.dp))
+
+        Box(
+            modifier = Modifier
+                .size(32.dp)
+                .clip(CircleShape)
+                .background(
+                    when (event.eventType) {
+                        "SCREEN_ON" -> MaterialTheme.colorScheme.primaryContainer
+                        "SCREEN_UNLOCK" -> MaterialTheme.colorScheme.secondaryContainer
+                        "SCREEN_OFF" -> MaterialTheme.colorScheme.surfaceVariant
+                        else -> MaterialTheme.colorScheme.surfaceVariant
+                    }
+                ),
+            contentAlignment = Alignment.Center
         ) {
-            Box(
-                modifier = Modifier
-                    .size(38.dp)
-                    .clip(CircleShape)
-                    .background(color.copy(alpha = 0.15f)),
-                contentAlignment = Alignment.Center
-            ) {
-                Icon(
-                    imageVector = icon,
-                    contentDescription = null,
-                    tint = color,
-                    modifier = Modifier.size(20.dp)
-                )
-            }
-            Spacer(modifier = Modifier.width(14.dp))
-            Column(modifier = Modifier.weight(1f)) {
-                Text(
-                    text = event.description,
-                    style = MaterialTheme.typography.bodyMedium,
-                    fontWeight = FontWeight.Medium
-                )
-                if (event.isEstimated) {
-                    Text(
-                        text = "Estimated interval",
-                        style = MaterialTheme.typography.labelSmall,
-                        color = MaterialTheme.colorScheme.outline
-                    )
+            when (event.eventType) {
+                "SCREEN_ON" -> Icon(Icons.Default.PhoneAndroid, contentDescription = "Screen On", modifier = Modifier.size(16.dp), tint = MaterialTheme.colorScheme.primary)
+                "SCREEN_UNLOCK" -> Icon(Icons.Default.LockOpen, contentDescription = "Unlock", modifier = Modifier.size(16.dp), tint = MaterialTheme.colorScheme.secondary)
+                "SCREEN_OFF" -> Icon(Icons.Default.Lock, contentDescription = "Screen Off", modifier = Modifier.size(16.dp), tint = MaterialTheme.colorScheme.outline)
+                else -> {
+                    if (event.packageName.isNotBlank()) {
+                        AppIcon(packageName = event.packageName, size = 24.dp)
+                    } else {
+                        Icon(Icons.Default.Apps, contentDescription = null, modifier = Modifier.size(16.dp))
+                    }
                 }
             }
+        }
+
+        Spacer(modifier = Modifier.width(12.dp))
+
+        Column(modifier = Modifier.weight(1f)) {
             Text(
-                text = timeFormatted,
-                style = MaterialTheme.typography.labelMedium,
-                color = MaterialTheme.colorScheme.onSurfaceVariant
+                text = event.description,
+                style = MaterialTheme.typography.bodyMedium,
+                fontWeight = FontWeight.SemiBold
             )
+            if (event.appName.isNotBlank() && event.eventType == "APP_FOREGROUND") {
+                Text(
+                    text = event.appName,
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
         }
     }
 }

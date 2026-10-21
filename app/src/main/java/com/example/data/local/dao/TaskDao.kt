@@ -36,4 +36,10 @@ interface TaskDao {
 
     @Query("SELECT * FROM tasks ORDER BY createdAt DESC")
     fun getAllTasks(): Flow<List<TaskEntity>>
+
+    @Query("SELECT * FROM tasks WHERE dateString >= :fromDate AND outcome = 'PENDING' ORDER BY dateString ASC, startTimeHour ASC, startTimeMinute ASC")
+    suspend fun getPendingTasksFromDateSync(fromDate: String): List<TaskEntity>
+
+    @Query("SELECT * FROM tasks WHERE dateString = :date AND outcome = 'PENDING'")
+    suspend fun getPendingTasksForDateSync(date: String): List<TaskEntity>
 }

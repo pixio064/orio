@@ -9,6 +9,9 @@ interface AppLimitDao {
     @Query("SELECT * FROM app_limits")
     fun getAllLimits(): Flow<List<AppLimitEntity>>
 
+    @Query("SELECT * FROM app_limits")
+    suspend fun getAllLimitsList(): List<AppLimitEntity>
+
     @Query("SELECT * FROM app_limits WHERE packageName = :packageName LIMIT 1")
     suspend fun getLimitByPackage(packageName: String): AppLimitEntity?
 

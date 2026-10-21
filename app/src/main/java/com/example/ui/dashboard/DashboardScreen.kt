@@ -7,6 +7,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -14,9 +15,6 @@ import androidx.compose.material.icons.filled.*
 import androidx.compose.material.icons.outlined.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
-import androidx.lifecycle.Lifecycle
-import androidx.lifecycle.LifecycleEventObserver
-import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -26,70 +24,117 @@ import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.ViewModel
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.viewModelScope
 import com.example.FocusTrackApp
 import com.example.data.local.entity.AppLimitEntity
 import com.example.data.local.entity.ReminderEntity
 import com.example.data.local.entity.TaskEntity
+import com.example.data.local.entity.TaskOutcome
+import com.example.scheduler.AlarmScheduler
 import com.example.ui.components.AppProgressSegment
-import com.example.ui.components.CircularProgressRing
+import com.example.ui.components.EmptyStateCard
 import com.example.ui.components.MultiSegmentCircularProgressRing
 import com.example.ui.components.SegmentPalette
 import com.example.ui.components.StatCard
+import com.example.ui.planner.TaskEditDialog
+import com.example.ui.util.AppIcon
 import com.example.usage.DayUsageSummary
 import com.example.usage.UsageStatsHelper
+import com.example.util.DateKeys
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
-import java.text.SimpleDateFormat
-import java.util.*
+import java.util.Calendar
 
 data class DashboardUiState(
     val hasUsagePermission: Boolean = false,
     val usageSummary: DayUsageSummary? = null,
     val dailyGoalMinutes: Int = 180,
     val activeLimits: List<AppLimitEntity> = emptyList(),
+    val appUsageMap: Map<String, Long> = emptyMap(),
     val nextReminder: ReminderEntity? = null,
     val pendingTasksCount: Int = 0,
     val completedTasksCount: Int = 0,
-    val isLoading: Boolean = true
+    val totalTasksCount: Int = 0,
+    val allTasksToday: List<TaskEntity> = emptyList(),
+    val isLoading: Boolean = true,
+    val errorMessage: String? = null
 )
 
 class DashboardViewModel : ViewModel() {
     private val _uiState = MutableStateFlow(DashboardUiState())
     val uiState: StateFlow<DashboardUiState> = _uiState.asStateFlow()
 
+    private var loadJob: Job? = null
+
     fun loadData(context: Context) {
+        loadJob?.cancel()
+        loadJob = viewModelScope.launch(Dispatchers.IO) {
+            try {
+                _uiState.update { it.copy(isLoading = true, errorMessage = null) }
+                val hasPermission = UsageStatsHelper.hasUsageStatsPermission(context)
+                val cal = Calendar.getInstance()
+                val summary = UsageStatsHelper.queryRealDayUsage(context, cal)
+
+                val app = context.applicationContext as FocusTrackApp
+                val userSettings = app.preferencesRepository.userSettingsFlow.first()
+                val limits = app.database.appLimitDao().getAllLimitsList().filter { it.isEnabled }
+                val reminders = app.database.reminderDao().getActiveRemindersSync()
+                val now = System.currentTimeMillis()
+                val nextRem = reminders.minByOrNull {
+                    val t = it.nextTriggerTimestamp
+                    if (t > now) t else Long.MAX_VALUE
+                }
+
+                val todayStr = DateKeys.today()
+                val tasks = app.database.taskDao().getTasksForDateSync(todayStr)
+                val pending = tasks.count { it.outcome == TaskOutcome.PENDING }
+                val completed = tasks.count { it.outcome == TaskOutcome.COMPLETED }
+                val total = tasks.size
+
+                val usageMap = summary.appUsages.associate { it.packageName to it.totalTimeInForegroundMs }
+
+                _uiState.update {
+                    it.copy(
+                        hasUsagePermission = hasPermission,
+                        usageSummary = summary,
+                        dailyGoalMinutes = userSettings.dailyScreenTimeGoalMinutes,
+                        activeLimits = limits,
+                        appUsageMap = usageMap,
+                        nextReminder = nextRem,
+                        pendingTasksCount = pending,
+                        completedTasksCount = completed,
+                        totalTasksCount = total,
+                        allTasksToday = tasks,
+                        isLoading = false
+                    )
+                }
+            } catch (e: Throwable) {
+                _uiState.update { it.copy(isLoading = false, errorMessage = e.message) }
+            }
+        }
+    }
+
+    fun saveTask(context: Context, task: TaskEntity) {
         viewModelScope.launch(Dispatchers.IO) {
-            val hasPermission = UsageStatsHelper.hasUsageStatsPermission(context)
-            val cal = Calendar.getInstance()
-            val summary = UsageStatsHelper.queryRealDayUsage(context, cal)
-
-            val app = context.applicationContext as FocusTrackApp
-            val userSettings = app.preferencesRepository.userSettingsFlow.first()
-            val limits = app.database.appLimitDao().getAllLimits()
-            val reminders = app.database.reminderDao().getActiveRemindersSync()
-            val nextRem = reminders.minByOrNull { it.nextTriggerTimestamp.takeIf { t -> t > System.currentTimeMillis() } ?: Long.MAX_VALUE }
-
-            val dateFormat = SimpleDateFormat("yyyy-MM-dd", Locale.getDefault())
-            val todayStr = dateFormat.format(Date())
-            val tasks = app.database.taskDao().getTasksForDateSync(todayStr)
-            val pending = tasks.count { it.outcome == com.example.data.local.entity.TaskOutcome.PENDING }
-            val completed = tasks.count { it.outcome == com.example.data.local.entity.TaskOutcome.COMPLETED }
-
-            _uiState.value = DashboardUiState(
-                hasUsagePermission = hasPermission,
-                usageSummary = summary,
-                dailyGoalMinutes = userSettings.dailyScreenTimeGoalMinutes,
-                nextReminder = nextRem,
-                pendingTasksCount = pending,
-                completedTasksCount = completed,
-                isLoading = false
-            )
+            try {
+                val app = context.applicationContext as FocusTrackApp
+                val id = app.database.taskDao().insertTask(task)
+                val savedTask = if (task.id == 0L) task.copy(id = id) else task
+                if (savedTask.reminderMinutesBefore >= 0 && savedTask.outcome == TaskOutcome.PENDING) {
+                    AlarmScheduler.scheduleTask(context, savedTask)
+                }
+                loadData(context)
+            } catch (_: Throwable) {}
         }
     }
 }
@@ -109,6 +154,8 @@ fun DashboardScreen(
     val uiState by viewModel.uiState.collectAsState()
     val lifecycleOwner = LocalLifecycleOwner.current
 
+    var showAddTaskDialog by remember { mutableStateOf(false) }
+
     DisposableEffect(lifecycleOwner) {
         val observer = LifecycleEventObserver { _, event ->
             if (event == Lifecycle.Event.ON_RESUME) {
@@ -124,7 +171,6 @@ fun DashboardScreen(
     val summary = uiState.usageSummary
     val screenOnMins = (summary?.totalScreenOnTimeMs ?: 0L) / (60 * 1000)
     val goalMins = uiState.dailyGoalMinutes.coerceAtLeast(1)
-    val progress = (screenOnMins.toFloat() / goalMins).coerceIn(0f, 1f)
 
     var selectedAppSegment by remember { mutableStateOf<AppProgressSegment?>(null) }
     val appSegments = remember(summary) {
@@ -139,49 +185,24 @@ fun DashboardScreen(
             TopAppBar(
                 title = {
                     Column {
-                        val cal = Calendar.getInstance()
-                        val hour = cal.get(Calendar.HOUR_OF_DAY)
-                        val greeting = when {
-                            hour < 12 -> "Good Morning ☀️"
-                            hour < 17 -> "Good Afternoon 🌤️"
-                            hour < 21 -> "Good Evening 🌅"
-                            else -> "Good Night 🌙"
-                        }
-                        val dateFormatted = SimpleDateFormat("EEEE, MMMM d", Locale.getDefault()).format(Date())
                         Text(
-                            text = greeting,
+                            text = "PIXIO 1.1",
                             style = MaterialTheme.typography.titleLarge,
                             fontWeight = FontWeight.Bold
                         )
                         Text(
-                            text = dateFormatted,
-                            style = MaterialTheme.typography.bodySmall,
+                            text = "Daily Screen Balance & Productivity",
+                            style = MaterialTheme.typography.labelSmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
                     }
                 },
                 actions = {
-                    if (com.example.BuildConfig.DEBUG) {
-                        Surface(
-                            shape = RoundedCornerShape(8.dp),
-                            color = if (uiState.hasUsagePermission) Color(0xFFDCFCE7) else Color(0xFFFEF3C7),
-                            border = BorderStroke(1.dp, if (uiState.hasUsagePermission) Color(0xFF16A34A) else Color(0xFFD97706)),
-                            modifier = Modifier.padding(end = 4.dp)
-                        ) {
-                            Text(
-                                text = if (uiState.hasUsagePermission) "Data: Real" else "Data: Need Perm",
-                                style = MaterialTheme.typography.labelSmall,
-                                fontWeight = FontWeight.Bold,
-                                color = if (uiState.hasUsagePermission) Color(0xFF15803D) else Color(0xFFB45309),
-                                modifier = Modifier.padding(horizontal = 6.dp, vertical = 3.dp)
-                            )
-                        }
-                    }
                     IconButton(
                         onClick = onOpenSettings,
-                        modifier = Modifier.testTag("settings_button")
+                        modifier = Modifier.testTag("dashboard_settings_btn")
                     ) {
-                        Icon(Icons.Outlined.Settings, contentDescription = "Settings")
+                        Icon(Icons.Default.Settings, contentDescription = "Open Settings")
                     }
                 },
                 colors = TopAppBarDefaults.topAppBarColors(
@@ -193,61 +214,75 @@ fun DashboardScreen(
     ) { innerPadding ->
         LazyColumn(
             contentPadding = PaddingValues(
-                top = innerPadding.calculateTopPadding() + 8.dp,
-                bottom = innerPadding.calculateBottomPadding() + 24.dp,
                 start = 16.dp,
-                end = 16.dp
+                end = 16.dp,
+                top = innerPadding.calculateTopPadding() + 8.dp,
+                bottom = innerPadding.calculateBottomPadding() + 80.dp
             ),
             verticalArrangement = Arrangement.spacedBy(16.dp),
             modifier = Modifier.fillMaxSize()
         ) {
-            // Permission Banner (if not granted)
+            // Permission Alert Banner
             if (!uiState.hasUsagePermission) {
                 item {
                     Card(
                         shape = RoundedCornerShape(20.dp),
-                        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.tertiaryContainer),
+                        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.errorContainer),
                         modifier = Modifier.fillMaxWidth().testTag("permission_banner")
                     ) {
                         Row(
-                            modifier = Modifier.padding(16.dp),
-                            verticalAlignment = Alignment.CenterVertically
+                            verticalAlignment = Alignment.CenterVertically,
+                            modifier = Modifier.padding(16.dp)
                         ) {
                             Icon(
-                                imageVector = Icons.Default.Security,
-                                contentDescription = null,
-                                tint = MaterialTheme.colorScheme.onTertiaryContainer,
-                                modifier = Modifier.size(32.dp)
+                                imageVector = Icons.Default.Warning,
+                                contentDescription = "Warning",
+                                tint = MaterialTheme.colorScheme.error
                             )
-                            Spacer(modifier = Modifier.width(16.dp))
+                            Spacer(modifier = Modifier.width(12.dp))
                             Column(modifier = Modifier.weight(1f)) {
                                 Text(
-                                    text = "Enable Real Usage Access",
-                                    style = MaterialTheme.typography.titleSmall,
+                                    text = "Usage Access Required",
+                                    style = MaterialTheme.typography.titleMedium,
                                     fontWeight = FontWeight.Bold,
-                                    color = MaterialTheme.colorScheme.onTertiaryContainer
+                                    color = MaterialTheme.colorScheme.onErrorContainer
                                 )
                                 Text(
-                                    text = "FocusTrack queries device UsageStats locally on-device. No data ever leaves your phone.",
+                                    text = "PIXIO needs permission to accurately measure real app screen time and enforce limits.",
                                     style = MaterialTheme.typography.bodySmall,
-                                    color = MaterialTheme.colorScheme.onTertiaryContainer.copy(alpha = 0.85f)
+                                    color = MaterialTheme.colorScheme.onErrorContainer.copy(alpha = 0.8f)
                                 )
-                                Spacer(modifier = Modifier.height(8.dp))
-                                Button(
-                                    onClick = { UsageStatsHelper.openUsageAccessSettings(context) },
-                                    colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.tertiary),
-                                    shape = RoundedCornerShape(10.dp),
-                                    modifier = Modifier.testTag("grant_usage_permission_btn")
-                                ) {
-                                    Text("Grant Access")
-                                }
+                            }
+                            Button(
+                                onClick = onOpenSettings,
+                                colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error),
+                                shape = RoundedCornerShape(12.dp)
+                            ) {
+                                Text("Grant")
                             }
                         }
                     }
                 }
             }
 
-            // Samsung Wellbeing-Style Circular Progress Card
+            // Error state banner if error occurred
+            if (uiState.errorMessage != null) {
+                item {
+                    Card(
+                        shape = RoundedCornerShape(16.dp),
+                        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.5f)),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Row(modifier = Modifier.padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
+                            Icon(Icons.Default.Info, contentDescription = "Info", tint = MaterialTheme.colorScheme.error)
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Text(text = "Notice: ${uiState.errorMessage}", style = MaterialTheme.typography.bodySmall)
+                        }
+                    }
+                }
+            }
+
+            // Circular Screen Time Progress Card
             item {
                 Card(
                     shape = RoundedCornerShape(28.dp),
@@ -292,7 +327,7 @@ fun DashboardScreen(
                                     color = MaterialTheme.colorScheme.onSurfaceVariant
                                 )
                             }
-                            Divider(
+                            HorizontalDivider(
                                 modifier = Modifier.height(36.dp).width(1.dp),
                                 color = MaterialTheme.colorScheme.outline.copy(alpha = 0.3f)
                             )
@@ -308,7 +343,7 @@ fun DashboardScreen(
                                     color = MaterialTheme.colorScheme.onSurfaceVariant
                                 )
                             }
-                            Divider(
+                            HorizontalDivider(
                                 modifier = Modifier.height(36.dp).width(1.dp),
                                 color = MaterialTheme.colorScheme.outline.copy(alpha = 0.3f)
                             )
@@ -331,7 +366,7 @@ fun DashboardScreen(
                 }
             }
 
-            // Stat Cards Grid
+            // Stat Cards Grid: Most Used App & Tasks Progress (denominator includes all tasks)
             item {
                 Row(
                     horizontalArrangement = Arrangement.spacedBy(12.dp),
@@ -348,13 +383,103 @@ fun DashboardScreen(
                     )
                     StatCard(
                         title = "Tasks Progress",
-                        value = "${uiState.completedTasksCount} / ${uiState.pendingTasksCount + uiState.completedTasksCount}",
+                        value = "${uiState.completedTasksCount} / ${uiState.totalTasksCount}",
                         subtitle = "${uiState.pendingTasksCount} tasks pending",
                         icon = Icons.Default.CheckCircleOutline,
                         iconTint = MaterialTheme.colorScheme.secondary,
                         modifier = Modifier.weight(1f),
                         onClick = onNavigateToPlanner
                     )
+                }
+            }
+
+            // App Limits & Enforcement Progress Card (Item 1)
+            item {
+                Card(
+                    shape = RoundedCornerShape(24.dp),
+                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+                    modifier = Modifier.fillMaxWidth().testTag("app_limits_dashboard_card")
+                ) {
+                    Column(modifier = Modifier.padding(20.dp)) {
+                        Row(
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically,
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Text(
+                                text = "Active App Limits",
+                                style = MaterialTheme.typography.titleMedium,
+                                fontWeight = FontWeight.Bold
+                            )
+                            TextButton(onClick = onNavigateToUsage) {
+                                Text("Manage Limits")
+                            }
+                        }
+
+                        if (uiState.activeLimits.isEmpty()) {
+                            Text(
+                                text = "No app limits set. You can set daily usage thresholds for apps in Usage & Apps.",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        } else {
+                            Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                                uiState.activeLimits.forEach { limit ->
+                                    val usedMs = uiState.appUsageMap[limit.packageName] ?: 0L
+                                    val usedMins = (usedMs / (60 * 1000)).toInt()
+                                    val limitMins = limit.limitMinutes.coerceAtLeast(1)
+                                    val limitRatio = (usedMins.toFloat() / limitMins).coerceIn(0f, 1f)
+                                    val isOverLimit = usedMins >= limitMins
+                                    val isWarning = usedMins >= (limitMins * limit.warningThresholdPercent / 100)
+
+                                    Row(
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        modifier = Modifier.fillMaxWidth().clickable { onNavigateToAppDetail(limit.packageName) }
+                                    ) {
+                                        AppIcon(
+                                            packageName = limit.packageName,
+                                            size = 36.dp,
+                                            contentDescription = limit.appName
+                                        )
+                                        Spacer(modifier = Modifier.width(10.dp))
+                                        Column(modifier = Modifier.weight(1f)) {
+                                            Row(
+                                                horizontalArrangement = Arrangement.SpaceBetween,
+                                                modifier = Modifier.fillMaxWidth()
+                                            ) {
+                                                Text(
+                                                    text = limit.appName,
+                                                    style = MaterialTheme.typography.bodyMedium,
+                                                    fontWeight = FontWeight.SemiBold
+                                                )
+                                                Text(
+                                                    text = "$usedMins / $limitMins min",
+                                                    style = MaterialTheme.typography.labelSmall,
+                                                    fontWeight = FontWeight.Bold,
+                                                    color = when {
+                                                        isOverLimit -> MaterialTheme.colorScheme.error
+                                                        isWarning -> Color(0xFFFF6F00)
+                                                        else -> MaterialTheme.colorScheme.primary
+                                                    }
+                                                )
+                                            }
+                                            Spacer(modifier = Modifier.height(4.dp))
+                                            LinearProgressIndicator(
+                                                progress = { limitRatio },
+                                                modifier = Modifier.fillMaxWidth().height(6.dp).clip(RoundedCornerShape(3.dp)),
+                                                color = when {
+                                                    isOverLimit -> MaterialTheme.colorScheme.error
+                                                    isWarning -> Color(0xFFFF6F00)
+                                                    else -> MaterialTheme.colorScheme.primary
+                                                },
+                                                trackColor = MaterialTheme.colorScheme.surfaceVariant
+                                            )
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
 
@@ -379,7 +504,7 @@ fun DashboardScreen(
                             ) {
                                 Icon(
                                     imageVector = Icons.Default.NotificationsActive,
-                                    contentDescription = null,
+                                    contentDescription = "Active Reminder",
                                     tint = MaterialTheme.colorScheme.onPrimary
                                 )
                             }
@@ -407,7 +532,7 @@ fun DashboardScreen(
                 }
             }
 
-            // Quick Actions Row
+            // Quick Actions Row: "Start Focus" & "Add Task" (opens dialog directly)
             item {
                 Row(
                     horizontalArrangement = Arrangement.spacedBy(12.dp),
@@ -418,17 +543,17 @@ fun DashboardScreen(
                         shape = RoundedCornerShape(16.dp),
                         modifier = Modifier.weight(1f).testTag("quick_focus_btn")
                     ) {
-                        Icon(Icons.Default.PlayArrow, contentDescription = null)
+                        Icon(Icons.Default.PlayArrow, contentDescription = "Start Focus")
                         Spacer(modifier = Modifier.width(8.dp))
                         Text("Start Focus")
                     }
 
                     FilledTonalButton(
-                        onClick = onNavigateToPlanner,
+                        onClick = { showAddTaskDialog = true },
                         shape = RoundedCornerShape(16.dp),
                         modifier = Modifier.weight(1f).testTag("plan_tomorrow_btn")
                     ) {
-                        Icon(Icons.Default.Add, contentDescription = null)
+                        Icon(Icons.Default.Add, contentDescription = "Add Task")
                         Spacer(modifier = Modifier.width(8.dp))
                         Text("Add Task")
                     }
@@ -459,46 +584,46 @@ fun DashboardScreen(
                         }
                         Spacer(modifier = Modifier.height(12.dp))
 
-                        val topApps = summary?.appUsages?.take(4) ?: emptyList()
-                        if (topApps.isEmpty()) {
+                        if (summary?.appUsages.isNullOrEmpty()) {
                             Text(
                                 text = "No app usage recorded yet today.",
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
                         } else {
-                            topApps.forEach { app ->
-                                val mins = app.totalTimeInForegroundMs / (60 * 1000)
-                                val appFraction = if (screenOnMins > 0) (mins.toFloat() / screenOnMins).let { if (it.isNaN() || it.isInfinite()) 0f else it.coerceIn(0f, 1f) } else 0f
-                                Column(
-                                    modifier = Modifier
-                                        .fillMaxWidth()
-                                        .clip(RoundedCornerShape(12.dp))
-                                        .clickable { onNavigateToAppDetail(app.packageName) }
-                                        .padding(horizontal = 6.dp, vertical = 6.dp)
-                                ) {
+                            val topApps = summary?.appUsages?.take(4) ?: emptyList()
+                            Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                                topApps.forEach { appItem ->
+                                    val minutes = appItem.totalTimeInForegroundMs / (60 * 1000)
                                     Row(
-                                        horizontalArrangement = Arrangement.SpaceBetween,
-                                        modifier = Modifier.fillMaxWidth()
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        modifier = Modifier.fillMaxWidth().clickable { onNavigateToAppDetail(appItem.packageName) }
                                     ) {
-                                        Text(
-                                            text = app.appName,
-                                            style = MaterialTheme.typography.bodyMedium,
-                                            fontWeight = FontWeight.Medium
+                                        AppIcon(
+                                            packageName = appItem.packageName,
+                                            size = 38.dp,
+                                            contentDescription = appItem.appName
                                         )
+                                        Spacer(modifier = Modifier.width(12.dp))
+                                        Column(modifier = Modifier.weight(1f)) {
+                                            Text(
+                                                text = appItem.appName,
+                                                style = MaterialTheme.typography.bodyMedium,
+                                                fontWeight = FontWeight.SemiBold
+                                            )
+                                            Text(
+                                                text = "${appItem.launchCount} launches • ${appItem.category}",
+                                                style = MaterialTheme.typography.labelSmall,
+                                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                                            )
+                                        }
                                         Text(
-                                            text = "${mins}m (${app.launchCount} launches)",
-                                            style = MaterialTheme.typography.bodySmall,
-                                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                                            text = if (minutes >= 60) "${minutes / 60}h ${minutes % 60}m" else "${minutes}m",
+                                            style = MaterialTheme.typography.labelLarge,
+                                            fontWeight = FontWeight.Bold,
+                                            color = MaterialTheme.colorScheme.primary
                                         )
                                     }
-                                    Spacer(modifier = Modifier.height(4.dp))
-                                    LinearProgressIndicator(
-                                        progress = { appFraction.coerceIn(0f, 1f) },
-                                        modifier = Modifier.fillMaxWidth().height(6.dp).clip(RoundedCornerShape(3.dp)),
-                                        color = MaterialTheme.colorScheme.primary,
-                                        trackColor = MaterialTheme.colorScheme.surfaceVariant
-                                    )
                                 }
                             }
                         }
@@ -506,5 +631,18 @@ fun DashboardScreen(
                 }
             }
         }
+    }
+
+    if (showAddTaskDialog) {
+        TaskEditDialog(
+            existingTask = null,
+            defaultDate = DateKeys.today(),
+            existingTasksOnDate = uiState.allTasksToday,
+            onDismiss = { showAddTaskDialog = false },
+            onSave = { task ->
+                viewModel.saveTask(context, task)
+                showAddTaskDialog = false
+            }
+        )
     }
 }

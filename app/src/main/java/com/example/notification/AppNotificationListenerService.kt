@@ -3,7 +3,6 @@ package com.example.notification
 import android.app.Notification
 import android.content.Context
 import android.content.Intent
-import android.content.pm.PackageManager
 import android.os.Build
 import android.provider.Settings
 import android.service.notification.NotificationListenerService
@@ -11,39 +10,63 @@ import android.service.notification.StatusBarNotification
 import androidx.core.app.NotificationManagerCompat
 import com.example.FocusTrackApp
 import com.example.data.local.entity.NotificationRecordEntity
+import com.example.util.DateKeys
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
-import java.text.SimpleDateFormat
-import java.util.*
+import java.util.Calendar
 
 class AppNotificationListenerService : NotificationListenerService() {
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private var lastPruneTimestamp = 0L
+
+    // In-memory cache to detect and drop duplicate updates within 2 seconds
+    private val recentKeys = object : LinkedHashMap<String, Long>(64, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Long>?): Boolean {
+            return size > 150
+        }
+    }
 
     override fun onNotificationPosted(sbn: StatusBarNotification?) {
         super.onNotificationPosted(sbn)
         if (sbn == null) return
 
         val pkg = sbn.packageName ?: return
-        // Ignore own app or persistent system service notifications if desired
         if (pkg == packageName) return
-        val notification = sbn.notification ?: return
-        val isOngoing = (notification.flags and Notification.FLAG_ONGOING_EVENT) != 0
-        if (isOngoing) return // ignore persistent foreground progress notifications
 
+        val notification = sbn.notification ?: return
+
+        // 1. Ignore persistent ongoing notifications
+        val isOngoing = (notification.flags and Notification.FLAG_ONGOING_EVENT) != 0
+        if (isOngoing) return
+
+        // 2. Ignore group summaries
+        val isGroupSummary = (notification.flags and Notification.FLAG_GROUP_SUMMARY) != 0
+        if (isGroupSummary) return
+
+        // 3. Ignore duplicate updates for the same notification key within 2000ms
         val now = System.currentTimeMillis()
+        val notifKey = sbn.key ?: "$pkg:${sbn.id}"
+        synchronized(recentKeys) {
+            val lastSeen = recentKeys[notifKey]
+            if (lastSeen != null && (now - lastSeen) < 2000L) {
+                return
+            }
+            recentKeys[notifKey] = now
+        }
+
         val cal = Calendar.getInstance().apply { timeInMillis = now }
         val hour = cal.get(Calendar.HOUR_OF_DAY)
-        val dateFormat = SimpleDateFormat("yyyy-MM-dd", Locale.getDefault())
-        val dateString = dateFormat.format(cal.time)
+        val dateString = DateKeys.today()
 
         val appName = try {
             val pm = packageManager
             val info = pm.getApplicationInfo(pkg, 0)
             pm.getApplicationLabel(info).toString()
-        } catch (e: Exception) {
+        } catch (_: Exception) {
             pkg.substringAfterLast('.')
         }
 
@@ -59,10 +82,22 @@ class AppNotificationListenerService : NotificationListenerService() {
                         dateString = dateString
                     )
                 )
-            } catch (e: Exception) {
+
+                // Schedule pruning of records older than 30 days once per 24 hours
+                if (now - lastPruneTimestamp > 24 * 60 * 60 * 1000L) {
+                    lastPruneTimestamp = now
+                    val thirtyDaysAgo = now - 30L * 24 * 60 * 60 * 1000L
+                    app.database.notificationRecordDao().pruneOldRecords(thirtyDaysAgo)
+                }
+            } catch (_: Exception) {
                 // Silently ignore DB errors
             }
         }
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        scope.cancel()
     }
 
     companion object {
@@ -80,8 +115,7 @@ class AppNotificationListenerService : NotificationListenerService() {
             intent.flags = Intent.FLAG_ACTIVITY_NEW_TASK
             try {
                 context.startActivity(intent)
-            } catch (e: Exception) {
-                // Fallback to general settings
+            } catch (_: Exception) {
                 val fallback = Intent(Settings.ACTION_SETTINGS).apply {
                     flags = Intent.FLAG_ACTIVITY_NEW_TASK
                 }

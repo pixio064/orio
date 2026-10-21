@@ -10,6 +10,9 @@ interface HabitDao {
     @Query("SELECT * FROM habits WHERE isPaused = 0 ORDER BY createdAt ASC")
     fun getAllActiveHabits(): Flow<List<HabitEntity>>
 
+    @Query("SELECT * FROM habits WHERE isPaused = 0 ORDER BY createdAt ASC")
+    suspend fun getAllActiveHabitsSync(): List<HabitEntity>
+
     @Query("SELECT * FROM habits ORDER BY createdAt ASC")
     fun getAllHabits(): Flow<List<HabitEntity>>
 
@@ -31,6 +34,12 @@ interface HabitDao {
 
     @Query("SELECT * FROM habit_logs WHERE habitId = :habitId")
     fun getLogsForHabit(habitId: Long): Flow<List<HabitLogEntity>>
+
+    @Query("SELECT * FROM habit_logs WHERE habitId = :habitId ORDER BY dateString DESC")
+    suspend fun getLogsForHabitSync(habitId: Long): List<HabitLogEntity>
+
+    @Query("SELECT * FROM habit_logs ORDER BY dateString DESC")
+    fun getAllHabitLogs(): Flow<List<HabitLogEntity>>
 
     @Query("SELECT * FROM habit_logs WHERE habitId = :habitId AND dateString = :dateString LIMIT 1")
     suspend fun getHabitLog(habitId: Long, dateString: String): HabitLogEntity?

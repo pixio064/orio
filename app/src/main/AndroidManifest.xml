@@ -10,7 +10,6 @@
     <!-- Notifications and Reminders -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" />
-    <uses-permission android:name="android.permission.USE_EXACT_ALARM" />
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
     <uses-permission android:name="android.permission.VIBRATE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
@@ -30,7 +29,7 @@
 
     <application
         android:name=".FocusTrackApp"
-        android:allowBackup="true"
+        android:allowBackup="false"
         android:dataExtractionRules="@xml/data_extraction_rules"
         android:fullBackupContent="@xml/backup_rules"
         android:icon="@mipmap/ic_launcher"
@@ -44,6 +43,7 @@
             android:exported="true"
             android:label="@string/app_name"
             android:theme="@style/Theme.MyApplication"
+            android:launchMode="singleTop"
             android:supportsPictureInPicture="true"
             android:configChanges="screenSize|smallestScreenSize|screenLayout|orientation"
             android:windowSoftInputMode="adjustResize">
@@ -63,7 +63,7 @@
             android:name=".receiver.NotificationActionReceiver"
             android:exported="false" />
 
-        <!-- Receiver for Restoring Alarms on Boot -->
+        <!-- Receiver for Restoring Alarms on Boot and Time Changes -->
         <receiver
             android:name=".receiver.BootReceiver"
             android:exported="true">
@@ -71,6 +71,8 @@
                 <action android:name="android.intent.action.BOOT_COMPLETED" />
                 <action android:name="android.intent.action.QUICKBOOT_POWERON" />
                 <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+                <action android:name="android.intent.action.TIME_SET" />
+                <action android:name="android.intent.action.TIMEZONE_CHANGED" />
             </intent-filter>
         </receiver>
 
@@ -92,7 +94,7 @@
         <!-- Notification Listener Service for Tracking App Notifications -->
         <service
             android:name=".notification.AppNotificationListenerService"
-            android:label="FocusTrack Notification Monitor"
+            android:label="PIXIO 1.1 Notification Monitor"
             android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE"
             android:exported="true">
             <intent-filter>

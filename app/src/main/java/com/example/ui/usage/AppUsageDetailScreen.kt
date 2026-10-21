@@ -170,11 +170,12 @@ fun AppUsageDetailScreen(
             appName = displayAppName,
             existingMinutes = existingLimit?.limitMinutes ?: 30,
             existingWarning = existingLimit?.warningThresholdPercent ?: 80,
-            existingNotify = existingLimit?.notifyOnLimit ?: true,
+            existingNotifyWarning = existingLimit?.notifyOnWarning ?: true,
+            existingNotifyLimit = existingLimit?.notifyOnLimit ?: true,
             hasExistingLimit = existingLimit != null,
             onDismiss = { viewModel.showLimitDialog(false) },
-            onSave = { mins, warning, notify ->
-                viewModel.saveLimit(context, mins, warning, notify)
+            onSave = { mins, warning, notifyWarn, notifyLim ->
+                viewModel.saveLimit(context, mins, warning, notifyWarn, notifyLim)
             },
             onRemove = {
                 viewModel.removeLimit(context)
@@ -1234,15 +1235,17 @@ fun AppLimitConfigDialog(
     appName: String,
     existingMinutes: Int,
     existingWarning: Int,
-    existingNotify: Boolean,
+    existingNotifyWarning: Boolean,
+    existingNotifyLimit: Boolean,
     hasExistingLimit: Boolean,
     onDismiss: () -> Unit,
-    onSave: (Int, Int, Boolean) -> Unit,
+    onSave: (Int, Int, Boolean, Boolean) -> Unit,
     onRemove: () -> Unit
 ) {
     var limitMinutes by remember { mutableStateOf(existingMinutes) }
     var warningPercent by remember { mutableStateOf(existingWarning) }
-    var notifyOnLimit by remember { mutableStateOf(existingNotify) }
+    var notifyOnWarning by remember { mutableStateOf(existingNotifyWarning) }
+    var notifyOnLimit by remember { mutableStateOf(existingNotifyLimit) }
 
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -1256,7 +1259,7 @@ fun AppLimitConfigDialog(
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(14.dp)) {
                 Text(
-                    text = "Configure a daily usage allowance. When the limit is reached, FocusTrack will alert you with a heads-up reminder.",
+                    text = "Configure a daily usage allowance. When the limit is reached, PIXIO 1.1 will alert you with a heads-up reminder.",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
@@ -1277,7 +1280,7 @@ fun AppLimitConfigDialog(
                     }
                 }
 
-                // Slider
+                // Allowance Slider
                 Row(
                     horizontalArrangement = Arrangement.SpaceBetween,
                     modifier = Modifier.fillMaxWidth()
@@ -1292,15 +1295,47 @@ fun AppLimitConfigDialog(
                     steps = 34
                 )
 
-                // 80% Warning Toggle
+                // Editable Warning Threshold Slider
+                val warnMinutes = (limitMinutes * warningPercent / 100)
+                Row(
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text("Warning Threshold:", style = MaterialTheme.typography.bodyMedium)
+                    Text("$warningPercent% (${warnMinutes}m)", style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Bold, color = Color(0xFFFF6F00))
+                }
+                Slider(
+                    value = warningPercent.toFloat(),
+                    onValueChange = { warningPercent = it.toInt() },
+                    valueRange = 50f..95f,
+                    steps = 8
+                )
+
+                // Switch 1: Warning Notification
                 Row(
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.SpaceBetween,
                     modifier = Modifier.fillMaxWidth()
                 ) {
                     Column(modifier = Modifier.weight(1f)) {
-                        Text("Early Warning at 80%", style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.SemiBold)
-                        Text("Alerts ${(limitMinutes * warningPercent / 100)}m into your limit", style = MaterialTheme.typography.bodySmall, color = Color(0xFF64748B))
+                        Text("Notify on Approaching ($warningPercent%)", style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.SemiBold)
+                        Text("Alerts once at $warnMinutes min into limit", style = MaterialTheme.typography.bodySmall, color = Color(0xFF64748B))
+                    }
+                    Switch(
+                        checked = notifyOnWarning,
+                        onCheckedChange = { notifyOnWarning = it }
+                    )
+                }
+
+                // Switch 2: Limit Reached Notification
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text("Notify at 100% Daily Limit", style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.SemiBold)
+                        Text("Alerts once at full $limitMinutes min", style = MaterialTheme.typography.bodySmall, color = Color(0xFF64748B))
                     }
                     Switch(
                         checked = notifyOnLimit,
@@ -1311,7 +1346,7 @@ fun AppLimitConfigDialog(
         },
         confirmButton = {
             Button(
-                onClick = { onSave(limitMinutes, warningPercent, notifyOnLimit) },
+                onClick = { onSave(limitMinutes, warningPercent, notifyOnWarning, notifyOnLimit) },
                 shape = RoundedCornerShape(12.dp),
                 colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2E7D32)),
                 modifier = Modifier.testTag("save_app_detail_limit_btn")

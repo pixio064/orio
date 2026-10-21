@@ -15,11 +15,11 @@ import com.example.receiver.NotificationActionReceiver
 
 object NotificationHelper {
 
-    const val CHANNEL_REMINDERS = "focus_track_reminders"
-    const val CHANNEL_LIMITS = "focus_track_limits"
-    const val CHANNEL_FOCUS = "focus_track_focus"
-    const val CHANNEL_PLANNER = "focus_track_planner"
-    const val CHANNEL_TIMER_SERVICE = "focus_track_timer_service"
+    const val CHANNEL_REMINDERS = "pixio_reminders"
+    const val CHANNEL_LIMITS = "pixio_limits"
+    const val CHANNEL_FOCUS = "pixio_focus"
+    const val CHANNEL_PLANNER = "pixio_planner"
+    const val CHANNEL_TIMER_SERVICE = "pixio_timer_service"
 
     const val ACTION_DONE = "com.example.ACTION_DONE"
     const val ACTION_SNOOZE = "com.example.ACTION_SNOOZE"
@@ -75,7 +75,7 @@ object NotificationHelper {
             // 4. Daily Planner (11 PM)
             val plannerChannel = NotificationChannel(
                 CHANNEL_PLANNER,
-                "Daily Planner Reminder",
+                "PIXIO 1.1 Daily Planner Reminder",
                 NotificationManager.IMPORTANCE_HIGH
             ).apply {
                 description = "Reminders to review today and plan tomorrow"
@@ -85,7 +85,7 @@ object NotificationHelper {
             // 5. Silent Ongoing Focus Timer Service
             val timerServiceChannel = NotificationChannel(
                 CHANNEL_TIMER_SERVICE,
-                "Focus Timer Running",
+                "PIXIO 1.1 Focus Timer Running",
                 NotificationManager.IMPORTANCE_LOW
             ).apply {
                 description = "Ongoing notification while focus timer is active"
@@ -104,9 +104,11 @@ object NotificationHelper {
         reminderId: Long,
         title: String,
         message: String,
-        category: String
+        category: String,
+        snoozeMinutes: Int = 10
     ) {
-        val notificationId = (reminderId.toInt() * 1000) + (System.currentTimeMillis() % 1000).toInt()
+        // Stable notification ID per reminder so repeated firings replace rather than stack
+        val notificationId = (reminderId % 100000).toInt()
         val notificationManager = context.getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
             ?: return
 
@@ -165,9 +167,10 @@ object NotificationHelper {
         )
 
         val displayMsg = if (message.isNotBlank()) message else "Time to focus on: $title"
+        val snoozeLabel = "Snooze (${snoozeMinutes}m)"
 
         val notification = NotificationCompat.Builder(context, CHANNEL_REMINDERS)
-            .setSmallIcon(R.mipmap.ic_launcher)
+            .setSmallIcon(R.drawable.ic_notification)
             .setContentTitle("⏰ $title")
             .setContentText(displayMsg)
             .setSubText(category)
@@ -175,9 +178,9 @@ object NotificationHelper {
             .setCategory(NotificationCompat.CATEGORY_REMINDER)
             .setAutoCancel(true)
             .setContentIntent(contentPendingIntent)
-            .addAction(R.mipmap.ic_launcher, context.getString(R.string.action_done), donePendingIntent)
-            .addAction(R.mipmap.ic_launcher, context.getString(R.string.action_snooze), snoozePendingIntent)
-            .addAction(R.mipmap.ic_launcher, context.getString(R.string.action_skip), skipPendingIntent)
+            .addAction(R.drawable.ic_notification, context.getString(R.string.action_done), donePendingIntent)
+            .addAction(R.drawable.ic_notification, snoozeLabel, snoozePendingIntent)
+            .addAction(R.drawable.ic_notification, context.getString(R.string.action_skip), skipPendingIntent)
             .build()
 
         notificationManager.notify(notificationId, notification)
@@ -188,19 +191,23 @@ object NotificationHelper {
         appName: String,
         usedMinutes: Int,
         limitMinutes: Int,
-        isWarning: Boolean
+        isWarning: Boolean,
+        thresholdPercent: Int = 80
     ) {
         val notificationManager = context.getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
             ?: return
 
         val title = if (isWarning) "⚠️ Approaching Limit: $appName" else "🛑 Limit Reached: $appName"
         val message = if (isWarning) {
-            "You have used $usedMinutes min of your $limitMinutes min daily limit (80%)."
+            "You have used $usedMinutes min of your $limitMinutes min daily limit ($thresholdPercent%)."
         } else {
             "You've reached your daily limit of $limitMinutes min on $appName. Time for a break!"
         }
 
-        val contentIntent = Intent(context, MainActivity::class.java)
+        val contentIntent = Intent(context, MainActivity::class.java).apply {
+            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
+            putExtra("NAVIGATE_TO", "usage")
+        }
         val contentPendingIntent = PendingIntent.getActivity(
             context,
             appName.hashCode(),
@@ -209,7 +216,7 @@ object NotificationHelper {
         )
 
         val notification = NotificationCompat.Builder(context, CHANNEL_LIMITS)
-            .setSmallIcon(R.mipmap.ic_launcher)
+            .setSmallIcon(R.drawable.ic_notification)
             .setContentTitle(title)
             .setContentText(message)
             .setPriority(NotificationCompat.PRIORITY_HIGH)
@@ -224,7 +231,10 @@ object NotificationHelper {
         val notificationManager = context.getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
             ?: return
 
-        val contentIntent = Intent(context, MainActivity::class.java)
+        val contentIntent = Intent(context, MainActivity::class.java).apply {
+            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
+            putExtra("NAVIGATE_TO", "focus")
+        }
         val contentPendingIntent = PendingIntent.getActivity(
             context,
             8881,
@@ -233,7 +243,7 @@ object NotificationHelper {
         )
 
         val notification = NotificationCompat.Builder(context, CHANNEL_FOCUS)
-            .setSmallIcon(R.mipmap.ic_launcher)
+            .setSmallIcon(R.drawable.ic_notification)
             .setContentTitle("🎉 Focus Session Completed!")
             .setContentText("Great work! You stayed focused for $durationMinutes minutes. Take a relaxing break.")
             .setPriority(NotificationCompat.PRIORITY_HIGH)
@@ -260,7 +270,7 @@ object NotificationHelper {
         )
 
         val notification = NotificationCompat.Builder(context, CHANNEL_PLANNER)
-            .setSmallIcon(R.mipmap.ic_launcher)
+            .setSmallIcon(R.drawable.ic_notification)
             .setContentTitle("🌙 Plan Tomorrow, One Step at a Time")
             .setContentText("Your next day starts here. Take 2 minutes to organize your tasks.")
             .setPriority(NotificationCompat.PRIORITY_HIGH)

@@ -34,21 +34,25 @@ import com.example.data.local.entity.ReminderFrequency
 import com.example.notification.NotificationHelper
 import com.example.scheduler.AlarmScheduler
 import com.example.ui.components.EmptyStateCard
+import com.example.util.DateKeys
+import com.example.util.HabitStreakCalculator
+import com.example.util.ScheduleParser
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
-import java.text.SimpleDateFormat
-import java.util.*
 
 data class HabitsUiState(
     val reminders: List<ReminderEntity> = emptyList(),
     val habits: List<HabitEntity> = emptyList(),
-    val todayHabitLogs: Set<Long> = emptySet(), // completed habit IDs today
-    val selectedTab: Int = 0, // 0: Reminders & Alerts, 1: Habits & Streaks
-    val isLoading: Boolean = true
+    val todayHabitLogs: Set<Long> = emptySet(),
+    val selectedTab: Int = 0,
+    val isLoading: Boolean = true,
+    val errorMessage: String? = null
 )
 
 data class ReminderTemplate(
@@ -57,8 +61,7 @@ data class ReminderTemplate(
     val category: String,
     val intervalMinutes: Int,
     val startHour: Int = 9,
-    val endHour: Int = 21,
-    val iconName: String = "WaterDrop"
+    val endHour: Int = 21
 )
 
 val PREMADE_TEMPLATES = listOf(
@@ -66,68 +69,107 @@ val PREMADE_TEMPLATES = listOf(
     ReminderTemplate("20-20-20 Eye Rest", "Look at something 20 feet away for 20 seconds", "Eye-Rest", 20),
     ReminderTemplate("Anti-Scrolling Pause", "Check in: Are you using your phone intentionally?", "Anti-Scroll", 25),
     ReminderTemplate("Desk Stretch & Posture", "Straighten back, roll shoulders, and stretch", "Stretch", 60),
-    ReminderTemplate("Study Focus Pomodoro", "Focus sprint reminder", "Focus", 50)
+    ReminderTemplate("Study Focus Sprint", "Stay immersed in current study block", "Focus", 50)
 )
 
 class HabitsViewModel : ViewModel() {
     private val _uiState = MutableStateFlow(HabitsUiState())
     val uiState: StateFlow<HabitsUiState> = _uiState.asStateFlow()
 
-    private val dateFormat = SimpleDateFormat("yyyy-MM-dd", Locale.getDefault())
+    private var loadJob: Job? = null
 
     fun loadData(context: Context) {
-        viewModelScope.launch(Dispatchers.IO) {
-            val app = context.applicationContext as FocusTrackApp
-            val remindersList = app.database.reminderDao().getAllReminders().first()
-            val habitsList = app.database.habitDao().getAllHabits().first()
+        loadJob?.cancel()
+        loadJob = viewModelScope.launch(Dispatchers.IO) {
+            try {
+                _uiState.update { it.copy(isLoading = true, errorMessage = null) }
+                val app = context.applicationContext as FocusTrackApp
+                val remindersList = app.database.reminderDao().getAllReminders().first()
+                val habitsList = app.database.habitDao().getAllHabits().first()
 
-            val today = dateFormat.format(Date())
-            val logs = app.database.habitDao().getHabitLogsForDate(today).first()
-            val completedIds = logs.map { it.habitId }.toSet()
+                val today = DateKeys.today()
+                val logs = app.database.habitDao().getHabitLogsForDate(today).first()
+                val completedIds = logs.map { it.habitId }.toSet()
 
-            _uiState.value = _uiState.value.copy(
-                reminders = remindersList,
-                habits = habitsList,
-                todayHabitLogs = completedIds,
-                isLoading = false
-            )
+                // Synchronize habit streaks from logs
+                for (habit in habitsList) {
+                    val habitLogs = app.database.habitDao().getLogsForHabitSync(habit.id)
+                    val dates = habitLogs.map { it.dateString }.toSet()
+                    val streak = HabitStreakCalculator.computeStreak(dates, habit.targetDaysPerWeek, today)
+                    if (streak != habit.currentStreak) {
+                        app.database.habitDao().updateHabit(
+                            habit.copy(currentStreak = streak, bestStreak = maxOf(habit.bestStreak, streak))
+                        )
+                    }
+                }
+
+                val refreshedHabits = app.database.habitDao().getAllHabits().first()
+
+                _uiState.update {
+                    it.copy(
+                        reminders = remindersList,
+                        habits = refreshedHabits,
+                        todayHabitLogs = completedIds,
+                        isLoading = false
+                    )
+                }
+            } catch (e: Throwable) {
+                _uiState.update { it.copy(isLoading = false, errorMessage = e.message) }
+            }
         }
     }
 
     fun setSelectedTab(tab: Int) {
-        _uiState.value = _uiState.value.copy(selectedTab = tab)
+        _uiState.update { it.copy(selectedTab = tab) }
     }
 
     fun toggleReminder(context: Context, reminder: ReminderEntity) {
         viewModelScope.launch(Dispatchers.IO) {
-            val app = context.applicationContext as FocusTrackApp
-            val updated = reminder.copy(isEnabled = !reminder.isEnabled)
-            app.database.reminderDao().updateReminder(updated)
-            if (updated.isEnabled) {
-                AlarmScheduler.scheduleReminder(context, updated)
-            } else {
-                AlarmScheduler.cancelReminder(context, updated.id)
-            }
-            loadData(context)
+            try {
+                val app = context.applicationContext as FocusTrackApp
+                val newEnabled = !reminder.isEnabled
+                val nextTrigger = if (newEnabled) AlarmScheduler.calculateNextReminderTrigger(reminder) else 0L
+                val updated = reminder.copy(isEnabled = newEnabled, nextTriggerTimestamp = nextTrigger)
+                app.database.reminderDao().updateReminder(updated)
+
+                if (newEnabled) {
+                    AlarmScheduler.scheduleReminder(context, updated)
+                } else {
+                    AlarmScheduler.cancelReminder(context, updated.id)
+                }
+                loadData(context)
+            } catch (_: Throwable) {}
         }
     }
 
     fun saveReminder(context: Context, reminder: ReminderEntity) {
         viewModelScope.launch(Dispatchers.IO) {
-            val app = context.applicationContext as FocusTrackApp
-            val id = app.database.reminderDao().insertReminder(reminder)
-            val saved = if (reminder.id == 0L) reminder.copy(id = id) else reminder
-            AlarmScheduler.scheduleReminder(context, saved)
-            loadData(context)
+            try {
+                val app = context.applicationContext as FocusTrackApp
+                val nextTrigger = if (reminder.isEnabled) AlarmScheduler.calculateNextReminderTrigger(reminder) else 0L
+                val entityToSave = reminder.copy(nextTriggerTimestamp = nextTrigger)
+
+                val id = app.database.reminderDao().insertReminder(entityToSave)
+                val finalReminder = if (entityToSave.id == 0L) entityToSave.copy(id = id) else entityToSave
+
+                if (finalReminder.isEnabled) {
+                    AlarmScheduler.scheduleReminder(context, finalReminder)
+                } else {
+                    AlarmScheduler.cancelReminder(context, finalReminder.id)
+                }
+                loadData(context)
+            } catch (_: Throwable) {}
         }
     }
 
     fun deleteReminder(context: Context, reminder: ReminderEntity) {
         viewModelScope.launch(Dispatchers.IO) {
-            val app = context.applicationContext as FocusTrackApp
-            app.database.reminderDao().deleteReminder(reminder)
-            AlarmScheduler.cancelReminder(context, reminder.id)
-            loadData(context)
+            try {
+                val app = context.applicationContext as FocusTrackApp
+                app.database.reminderDao().deleteReminder(reminder)
+                AlarmScheduler.cancelReminder(context, reminder.id)
+                loadData(context)
+            } catch (_: Throwable) {}
         }
     }
 
@@ -147,37 +189,75 @@ class HabitsViewModel : ViewModel() {
 
     fun toggleHabitCompletion(context: Context, habit: HabitEntity) {
         viewModelScope.launch(Dispatchers.IO) {
-            val app = context.applicationContext as FocusTrackApp
-            val today = dateFormat.format(Date())
-            val isCompleted = _uiState.value.todayHabitLogs.contains(habit.id)
+            try {
+                val app = context.applicationContext as FocusTrackApp
+                val today = DateKeys.today()
 
-            if (isCompleted) {
-                app.database.habitDao().deleteHabitLog(habit.id, today)
-                val newStreak = (habit.currentStreak - 1).coerceAtLeast(0)
-                app.database.habitDao().updateHabit(habit.copy(currentStreak = newStreak))
-            } else {
-                app.database.habitDao().insertHabitLog(HabitLogEntity(habitId = habit.id, dateString = today))
-                val newStreak = habit.currentStreak + 1
-                val newBest = maxOf(newStreak, habit.bestStreak)
-                app.database.habitDao().updateHabit(habit.copy(currentStreak = newStreak, bestStreak = newBest, lastCompletedDate = today))
-            }
-            loadData(context)
+                // Debounce using actual DB state
+                val existingLog = app.database.habitDao().getHabitLog(habit.id, today)
+                if (existingLog != null) {
+                    app.database.habitDao().deleteHabitLog(habit.id, today)
+                } else {
+                    app.database.habitDao().insertHabitLog(HabitLogEntity(habitId = habit.id, dateString = today))
+                }
+
+                val allLogs = app.database.habitDao().getLogsForHabitSync(habit.id)
+                val dates = allLogs.map { it.dateString }.toSet()
+                val streak = HabitStreakCalculator.computeStreak(dates, habit.targetDaysPerWeek, today)
+                val best = maxOf(habit.bestStreak, streak)
+
+                app.database.habitDao().updateHabit(
+                    habit.copy(
+                        currentStreak = streak,
+                        bestStreak = best,
+                        lastCompletedDate = if (existingLog == null) today else habit.lastCompletedDate
+                    )
+                )
+                loadData(context)
+            } catch (_: Throwable) {}
+        }
+    }
+
+    fun toggleHabitPause(context: Context, habit: HabitEntity) {
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val app = context.applicationContext as FocusTrackApp
+                val updated = habit.copy(isPaused = !habit.isPaused)
+                app.database.habitDao().updateHabit(updated)
+                if (updated.isPaused) {
+                    AlarmScheduler.cancelHabit(context, updated.id)
+                } else {
+                    AlarmScheduler.scheduleHabit(context, updated)
+                }
+                loadData(context)
+            } catch (_: Throwable) {}
         }
     }
 
     fun saveHabit(context: Context, habit: HabitEntity) {
         viewModelScope.launch(Dispatchers.IO) {
-            val app = context.applicationContext as FocusTrackApp
-            app.database.habitDao().insertHabit(habit)
-            loadData(context)
+            try {
+                val app = context.applicationContext as FocusTrackApp
+                val id = app.database.habitDao().insertHabit(habit)
+                val saved = if (habit.id == 0L) habit.copy(id = id) else habit
+                if (!saved.isPaused) {
+                    AlarmScheduler.scheduleHabit(context, saved)
+                } else {
+                    AlarmScheduler.cancelHabit(context, saved.id)
+                }
+                loadData(context)
+            } catch (_: Throwable) {}
         }
     }
 
     fun deleteHabit(context: Context, habit: HabitEntity) {
         viewModelScope.launch(Dispatchers.IO) {
-            val app = context.applicationContext as FocusTrackApp
-            app.database.habitDao().deleteHabit(habit)
-            loadData(context)
+            try {
+                val app = context.applicationContext as FocusTrackApp
+                app.database.habitDao().deleteHabit(habit)
+                AlarmScheduler.cancelHabit(context, habit.id)
+                loadData(context)
+            } catch (_: Throwable) {}
         }
     }
 }
@@ -191,8 +271,12 @@ fun HabitsScreen(
     val context = LocalContext.current
     val uiState by viewModel.uiState.collectAsState()
 
-    var showCreateReminderDialog by remember { mutableStateOf(false) }
-    var showCreateHabitDialog by remember { mutableStateOf(false) }
+    var showReminderDialog by remember { mutableStateOf(false) }
+    var editingReminder by remember { mutableStateOf<ReminderEntity?>(null) }
+
+    var showHabitDialog by remember { mutableStateOf(false) }
+    var editingHabit by remember { mutableStateOf<HabitEntity?>(null) }
+
     var naturalLanguageInput by remember { mutableStateOf("") }
 
     LaunchedEffect(Unit) {
@@ -215,9 +299,9 @@ fun HabitsScreen(
                         shape = RoundedCornerShape(12.dp),
                         modifier = Modifier.padding(end = 8.dp).testTag("test_notification_btn")
                     ) {
-                        Icon(Icons.Default.NotificationsActive, contentDescription = null, modifier = Modifier.size(16.dp))
+                        Icon(Icons.Default.NotificationsActive, contentDescription = "Test Notification", modifier = Modifier.size(16.dp))
                         Spacer(modifier = Modifier.width(4.dp))
-                        Text("Test Pop-Up", style = MaterialTheme.typography.labelSmall)
+                        Text("Test Alert", style = MaterialTheme.typography.labelSmall)
                     }
                 },
                 colors = TopAppBarDefaults.topAppBarColors(
@@ -228,14 +312,20 @@ fun HabitsScreen(
         floatingActionButton = {
             FloatingActionButton(
                 onClick = {
-                    if (uiState.selectedTab == 0) showCreateReminderDialog = true else showCreateHabitDialog = true
+                    if (uiState.selectedTab == 0) {
+                        editingReminder = null
+                        showReminderDialog = true
+                    } else {
+                        editingHabit = null
+                        showHabitDialog = true
+                    }
                 },
                 containerColor = MaterialTheme.colorScheme.primary,
                 contentColor = MaterialTheme.colorScheme.onPrimary,
                 shape = RoundedCornerShape(18.dp),
                 modifier = Modifier.testTag("fab_add_habit_or_reminder")
             ) {
-                Icon(Icons.Default.Add, contentDescription = "Add")
+                Icon(Icons.Default.Add, contentDescription = "Add Item")
             }
         },
         modifier = modifier
@@ -245,7 +335,6 @@ fun HabitsScreen(
                 .fillMaxSize()
                 .padding(innerPadding)
         ) {
-            // Tab Selector
             TabRow(
                 selectedTabIndex = uiState.selectedTab,
                 containerColor = MaterialTheme.colorScheme.background,
@@ -255,14 +344,14 @@ fun HabitsScreen(
                     selected = uiState.selectedTab == 0,
                     onClick = { viewModel.setSelectedTab(0) },
                     text = { Text("Pop-up Reminders") },
-                    icon = { Icon(Icons.Default.Alarm, contentDescription = null) },
+                    icon = { Icon(Icons.Default.Alarm, contentDescription = "Reminders Tab") },
                     modifier = Modifier.testTag("tab_reminders")
                 )
                 Tab(
                     selected = uiState.selectedTab == 1,
                     onClick = { viewModel.setSelectedTab(1) },
                     text = { Text("Daily Habits & Streaks") },
-                    icon = { Icon(Icons.Default.Whatshot, contentDescription = null) },
+                    icon = { Icon(Icons.Default.Whatshot, contentDescription = "Habits Tab") },
                     modifier = Modifier.testTag("tab_habits")
                 )
             }
@@ -281,7 +370,7 @@ fun HabitsScreen(
                         OutlinedTextField(
                             value = naturalLanguageInput,
                             onValueChange = { naturalLanguageInput = it },
-                            placeholder = { Text("e.g. Drink water every 30 mins", style = MaterialTheme.typography.bodySmall) },
+                            placeholder = { Text("e.g. Drink water every 2 hours", style = MaterialTheme.typography.bodySmall) },
                             singleLine = true,
                             shape = RoundedCornerShape(12.dp),
                             modifier = Modifier.weight(1f).testTag("quick_reminder_input")
@@ -290,16 +379,14 @@ fun HabitsScreen(
                         Button(
                             onClick = {
                                 if (naturalLanguageInput.isNotBlank()) {
-                                    val text = naturalLanguageInput.trim()
-                                    // Parse interval minutes if found
-                                    val interval = Regex("(\\d+)\\s*(m|min|minute)", RegexOption.IGNORE_CASE)
-                                        .find(text)?.groupValues?.get(1)?.toIntOrNull() ?: 30
+                                    val parsed = ScheduleParser.parse(naturalLanguageInput)
                                     viewModel.saveReminder(
                                         context,
                                         ReminderEntity(
-                                            title = text.substringBefore("every").trim().ifEmpty { text },
-                                            intervalMinutes = interval,
-                                            frequency = ReminderFrequency.INTERVAL_MINUTES
+                                            title = parsed.title,
+                                            intervalMinutes = parsed.intervalMinutes,
+                                            frequency = parsed.frequency,
+                                            isEnabled = true
                                         )
                                     )
                                     naturalLanguageInput = ""
@@ -316,7 +403,7 @@ fun HabitsScreen(
 
                 // Ready-made Templates Carousel
                 Text(
-                    text = "Ready-Made Templates",
+                    text = "Quick Routines & Science Templates",
                     style = MaterialTheme.typography.labelLarge,
                     fontWeight = FontWeight.Bold,
                     modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp)
@@ -379,6 +466,10 @@ fun HabitsScreen(
                             ReminderItemCard(
                                 reminder = reminder,
                                 onToggle = { viewModel.toggleReminder(context, reminder) },
+                                onEdit = {
+                                    editingReminder = reminder
+                                    showReminderDialog = true
+                                },
                                 onDelete = { viewModel.deleteReminder(context, reminder) }
                             )
                         }
@@ -398,7 +489,10 @@ fun HabitsScreen(
                                 description = "Build healthy daily routines like drinking water, daily study, reading, or screen breaks.",
                                 icon = Icons.Outlined.Whatshot,
                                 actionText = "Create Habit",
-                                onActionClick = { showCreateHabitDialog = true }
+                                onActionClick = {
+                                    editingHabit = null
+                                    showHabitDialog = true
+                                }
                             )
                         }
                     } else {
@@ -408,6 +502,11 @@ fun HabitsScreen(
                                 habit = habit,
                                 isCompletedToday = isCompletedToday,
                                 onToggle = { viewModel.toggleHabitCompletion(context, habit) },
+                                onPauseToggle = { viewModel.toggleHabitPause(context, habit) },
+                                onEdit = {
+                                    editingHabit = habit
+                                    showHabitDialog = true
+                                },
                                 onDelete = { viewModel.deleteHabit(context, habit) }
                             )
                         }
@@ -417,24 +516,32 @@ fun HabitsScreen(
         }
     }
 
-    // Create Reminder Dialog
-    if (showCreateReminderDialog) {
-        CreateReminderDialog(
-            onDismiss = { showCreateReminderDialog = false },
+    if (showReminderDialog) {
+        ReminderEditorDialog(
+            initialReminder = editingReminder,
+            onDismiss = {
+                showReminderDialog = false
+                editingReminder = null
+            },
             onSave = { reminder ->
                 viewModel.saveReminder(context, reminder)
-                showCreateReminderDialog = false
+                showReminderDialog = false
+                editingReminder = null
             }
         )
     }
 
-    // Create Habit Dialog
-    if (showCreateHabitDialog) {
-        CreateHabitDialog(
-            onDismiss = { showCreateHabitDialog = false },
+    if (showHabitDialog) {
+        HabitEditorDialog(
+            initialHabit = editingHabit,
+            onDismiss = {
+                showHabitDialog = false
+                editingHabit = null
+            },
             onSave = { habit ->
                 viewModel.saveHabit(context, habit)
-                showCreateHabitDialog = false
+                showHabitDialog = false
+                editingHabit = null
             }
         )
     }
@@ -444,6 +551,7 @@ fun HabitsScreen(
 fun ReminderItemCard(
     reminder: ReminderEntity,
     onToggle: () -> Unit,
+    onEdit: () -> Unit,
     onDelete: () -> Unit
 ) {
     Card(
@@ -459,13 +567,16 @@ fun ReminderItemCard(
                 modifier = Modifier
                     .size(44.dp)
                     .clip(CircleShape)
-                    .background(MaterialTheme.colorScheme.primaryContainer),
+                    .background(
+                        if (reminder.isEnabled) MaterialTheme.colorScheme.primaryContainer
+                        else MaterialTheme.colorScheme.surfaceVariant
+                    ),
                 contentAlignment = Alignment.Center
             ) {
                 Icon(
                     imageVector = Icons.Default.Alarm,
-                    contentDescription = null,
-                    tint = MaterialTheme.colorScheme.primary
+                    contentDescription = "Reminder Icon",
+                    tint = if (reminder.isEnabled) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outline
                 )
             }
             Spacer(modifier = Modifier.width(14.dp))
@@ -475,8 +586,22 @@ fun ReminderItemCard(
                     style = MaterialTheme.typography.titleMedium,
                     fontWeight = FontWeight.Bold
                 )
+
+                val timingText = when (reminder.frequency) {
+                    ReminderFrequency.INTERVAL_MINUTES ->
+                        "Every ${reminder.intervalMinutes}m • ${String.format("%02d:%02d", reminder.startHour, reminder.startMinute)} - ${String.format("%02d:%02d", reminder.endHour, reminder.endMinute)}"
+                    ReminderFrequency.DAILY ->
+                        "Daily at ${String.format("%02d:%02d", reminder.specificHour, reminder.specificMinute)}"
+                    ReminderFrequency.WEEKDAYS ->
+                        "Weekdays at ${String.format("%02d:%02d", reminder.specificHour, reminder.specificMinute)}"
+                    ReminderFrequency.WEEKLY ->
+                        "Weekly at ${String.format("%02d:%02d", reminder.specificHour, reminder.specificMinute)}"
+                    ReminderFrequency.ONE_TIME ->
+                        "One-time at ${String.format("%02d:%02d", reminder.specificHour, reminder.specificMinute)}"
+                }
+
                 Text(
-                    text = "Every ${reminder.intervalMinutes}m • ${reminder.startHour}:00 - ${reminder.endHour}:00",
+                    text = timingText,
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
@@ -486,12 +611,16 @@ fun ReminderItemCard(
                     color = MaterialTheme.colorScheme.primary
                 )
             }
+            IconButton(onClick = onEdit, modifier = Modifier.size(48.dp)) {
+                Icon(Icons.Outlined.Edit, contentDescription = "Edit Reminder", tint = MaterialTheme.colorScheme.outline)
+            }
             Switch(
                 checked = reminder.isEnabled,
-                onCheckedChange = { onToggle() }
+                onCheckedChange = { onToggle() },
+                modifier = Modifier.testTag("toggle_reminder_${reminder.id}")
             )
-            IconButton(onClick = onDelete) {
-                Icon(Icons.Outlined.Delete, contentDescription = "Delete", tint = MaterialTheme.colorScheme.outline)
+            IconButton(onClick = onDelete, modifier = Modifier.size(48.dp)) {
+                Icon(Icons.Outlined.Delete, contentDescription = "Delete Reminder", tint = MaterialTheme.colorScheme.outline)
             }
         }
     }
@@ -502,11 +631,16 @@ fun HabitItemCard(
     habit: HabitEntity,
     isCompletedToday: Boolean,
     onToggle: () -> Unit,
+    onPauseToggle: () -> Unit,
+    onEdit: () -> Unit,
     onDelete: () -> Unit
 ) {
     Card(
         shape = RoundedCornerShape(20.dp),
-        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+        colors = CardDefaults.cardColors(
+            containerColor = if (habit.isPaused) MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f)
+            else MaterialTheme.colorScheme.surface
+        ),
         modifier = Modifier.fillMaxWidth().testTag("habit_card_${habit.id}")
     ) {
         Row(
@@ -515,75 +649,122 @@ fun HabitItemCard(
         ) {
             IconButton(
                 onClick = onToggle,
-                modifier = Modifier.size(44.dp).testTag("habit_check_${habit.id}")
+                enabled = !habit.isPaused,
+                modifier = Modifier.size(48.dp).testTag("habit_check_${habit.id}")
             ) {
                 Icon(
                     imageVector = if (isCompletedToday) Icons.Default.CheckCircle else Icons.Outlined.RadioButtonUnchecked,
-                    contentDescription = null,
-                    tint = if (isCompletedToday) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outline,
+                    contentDescription = if (isCompletedToday) "Mark Unfinished" else "Mark Finished",
+                    tint = if (habit.isPaused) MaterialTheme.colorScheme.outline
+                    else if (isCompletedToday) MaterialTheme.colorScheme.primary
+                    else MaterialTheme.colorScheme.outline,
                     modifier = Modifier.size(32.dp)
                 )
             }
-            Spacer(modifier = Modifier.width(12.dp))
+
+            Spacer(modifier = Modifier.width(10.dp))
+
             Column(modifier = Modifier.weight(1f)) {
-                Text(
-                    text = habit.name,
-                    style = MaterialTheme.typography.titleMedium,
-                    fontWeight = FontWeight.Bold
-                )
-                Text(
-                    text = "${habit.category} • Target ${habit.targetDaysPerWeek} days/week",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                )
-            }
-            // Streak Badge
-            Surface(
-                color = if (habit.currentStreak > 0) MaterialTheme.colorScheme.secondaryContainer else MaterialTheme.colorScheme.surfaceVariant,
-                shape = RoundedCornerShape(12.dp)
-            ) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        text = habit.name,
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.Bold
+                    )
+                    if (habit.isPaused) {
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text(
+                            text = "(Paused)",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.error
+                        )
+                    }
+                }
+
                 Row(
                     verticalAlignment = Alignment.CenterVertically,
-                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
+                    Text(
+                        text = "${habit.category} • Target ${habit.targetDaysPerWeek}d/wk",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    if (habit.reminderHour in 0..23) {
+                        Text(
+                            text = "⏰ ${String.format("%02d:%02d", habit.reminderHour, habit.reminderMinute)}",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.primary
+                        )
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(4.dp))
+                Row(verticalAlignment = Alignment.CenterVertically) {
                     Icon(
                         imageVector = Icons.Default.Whatshot,
-                        contentDescription = null,
-                        tint = if (habit.currentStreak > 0) MaterialTheme.colorScheme.secondary else MaterialTheme.colorScheme.outline,
+                        contentDescription = "Streak Flame",
+                        tint = if (habit.currentStreak > 0) Color(0xFFFF6F00) else MaterialTheme.colorScheme.outline,
                         modifier = Modifier.size(16.dp)
                     )
                     Spacer(modifier = Modifier.width(4.dp))
                     Text(
-                        text = "${habit.currentStreak}d",
-                        style = MaterialTheme.typography.labelMedium,
-                        fontWeight = FontWeight.Bold
+                        text = "${habit.currentStreak} day streak (Best: ${habit.bestStreak})",
+                        style = MaterialTheme.typography.labelSmall,
+                        fontWeight = FontWeight.SemiBold,
+                        color = if (habit.currentStreak > 0) Color(0xFFFF6F00) else MaterialTheme.colorScheme.onSurfaceVariant
                     )
                 }
             }
-            IconButton(onClick = onDelete) {
-                Icon(Icons.Outlined.Delete, contentDescription = "Delete", tint = MaterialTheme.colorScheme.outline)
+
+            IconButton(onClick = onPauseToggle, modifier = Modifier.size(48.dp)) {
+                Icon(
+                    imageVector = if (habit.isPaused) Icons.Default.PlayArrow else Icons.Default.Pause,
+                    contentDescription = if (habit.isPaused) "Resume Habit" else "Pause Habit",
+                    tint = MaterialTheme.colorScheme.primary
+                )
+            }
+
+            IconButton(onClick = onEdit, modifier = Modifier.size(48.dp)) {
+                Icon(Icons.Outlined.Edit, contentDescription = "Edit Habit", tint = MaterialTheme.colorScheme.outline)
+            }
+
+            IconButton(onClick = onDelete, modifier = Modifier.size(48.dp)) {
+                Icon(Icons.Outlined.Delete, contentDescription = "Delete Habit", tint = MaterialTheme.colorScheme.outline)
             }
         }
     }
 }
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun CreateReminderDialog(
+fun ReminderEditorDialog(
+    initialReminder: ReminderEntity?,
     onDismiss: () -> Unit,
     onSave: (ReminderEntity) -> Unit
 ) {
-    var title by remember { mutableStateOf("") }
-    var intervalMinutes by remember { mutableStateOf(30) }
-    var category by remember { mutableStateOf("Hydration") }
-    var snoozeMinutes by remember { mutableStateOf(10) }
+    var title by remember { mutableStateOf(initialReminder?.title ?: "") }
+    var category by remember { mutableStateOf(initialReminder?.category ?: "Health") }
+    var frequency by remember { mutableStateOf(initialReminder?.frequency ?: ReminderFrequency.INTERVAL_MINUTES) }
+    var intervalMinutes by remember { mutableStateOf(initialReminder?.intervalMinutes ?: 30) }
+    var startHour by remember { mutableStateOf(initialReminder?.startHour ?: 9) }
+    var startMinute by remember { mutableStateOf(initialReminder?.startMinute ?: 0) }
+    var endHour by remember { mutableStateOf(initialReminder?.endHour ?: 21) }
+    var endMinute by remember { mutableStateOf(initialReminder?.endMinute ?: 0) }
+    var specificHour by remember { mutableStateOf(initialReminder?.specificHour ?: 9) }
+    var specificMinute by remember { mutableStateOf(initialReminder?.specificMinute ?: 0) }
+    var snoozeMinutes by remember { mutableStateOf(initialReminder?.snoozeMinutes ?: 10) }
 
-    val categories = listOf("Hydration", "Focus", "Stretch", "Anti-Scroll", "Eye-Rest", "Medicine", "Custom")
+    val categories = listOf("Health", "Eye-Rest", "Posture", "Hydration", "Focus", "Anti-Scroll")
 
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text("Create Smart Pop-Up Reminder", fontWeight = FontWeight.Bold) },
+        title = { Text(if (initialReminder == null) "Create Pop-Up Alert" else "Edit Pop-Up Alert", fontWeight = FontWeight.Bold) },
         text = {
-            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            Column(
+                verticalArrangement = Arrangement.spacedBy(10.dp),
+                modifier = Modifier.fillMaxWidth()
+            ) {
                 OutlinedTextField(
                     value = title,
                     onValueChange = { title = it },
@@ -592,18 +773,6 @@ fun CreateReminderDialog(
                     shape = RoundedCornerShape(12.dp),
                     modifier = Modifier.fillMaxWidth().testTag("reminder_title_input")
                 )
-
-                Text("Repeat Interval (Minutes):", style = MaterialTheme.typography.labelMedium)
-                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                    listOf(15, 30, 45, 60, 90).forEach { mins ->
-                        FilterChip(
-                            selected = intervalMinutes == mins,
-                            onClick = { intervalMinutes = mins },
-                            label = { Text("${mins}m") },
-                            shape = RoundedCornerShape(8.dp)
-                        )
-                    }
-                }
 
                 Text("Category:", style = MaterialTheme.typography.labelMedium)
                 LazyRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
@@ -616,17 +785,99 @@ fun CreateReminderDialog(
                         )
                     }
                 }
+
+                Text("Frequency:", style = MaterialTheme.typography.labelMedium)
+                LazyRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    items(ReminderFrequency.entries) { freq ->
+                        FilterChip(
+                            selected = frequency == freq,
+                            onClick = { frequency = freq },
+                            label = { Text(freq.name.replace("_", " ")) },
+                            shape = RoundedCornerShape(8.dp)
+                        )
+                    }
+                }
+
+                if (frequency == ReminderFrequency.INTERVAL_MINUTES) {
+                    Text("Interval: $intervalMinutes minutes (Min 5m)", style = MaterialTheme.typography.bodyMedium)
+                    Slider(
+                        value = intervalMinutes.toFloat(),
+                        onValueChange = { intervalMinutes = it.toInt().coerceAtLeast(5) },
+                        valueRange = 5f..120f,
+                        steps = 22
+                    )
+
+                    Text("Active Window (Overnight supported):", style = MaterialTheme.typography.labelMedium)
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        OutlinedTextField(
+                            value = String.format("%02d:%02d", startHour, startMinute),
+                            onValueChange = {
+                                val parts = it.split(":")
+                                if (parts.size == 2) {
+                                    startHour = (parts[0].toIntOrNull() ?: startHour).coerceIn(0, 23)
+                                    startMinute = (parts[1].toIntOrNull() ?: startMinute).coerceIn(0, 59)
+                                }
+                            },
+                            label = { Text("Start") },
+                            modifier = Modifier.weight(1f)
+                        )
+                        OutlinedTextField(
+                            value = String.format("%02d:%02d", endHour, endMinute),
+                            onValueChange = {
+                                val parts = it.split(":")
+                                if (parts.size == 2) {
+                                    endHour = (parts[0].toIntOrNull() ?: endHour).coerceIn(0, 23)
+                                    endMinute = (parts[1].toIntOrNull() ?: endMinute).coerceIn(0, 59)
+                                }
+                            },
+                            label = { Text("End") },
+                            modifier = Modifier.weight(1f)
+                        )
+                    }
+                } else {
+                    OutlinedTextField(
+                        value = String.format("%02d:%02d", specificHour, specificMinute),
+                        onValueChange = {
+                            val parts = it.split(":")
+                            if (parts.size == 2) {
+                                specificHour = (parts[0].toIntOrNull() ?: specificHour).coerceIn(0, 23)
+                                specificMinute = (parts[1].toIntOrNull() ?: specificMinute).coerceIn(0, 59)
+                            }
+                        },
+                        label = { Text("Trigger Time (HH:MM)") },
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                }
+
+                Text("Snooze Duration: $snoozeMinutes min", style = MaterialTheme.typography.bodyMedium)
+                Slider(
+                    value = snoozeMinutes.toFloat(),
+                    onValueChange = { snoozeMinutes = it.toInt() },
+                    valueRange = 5f..30f,
+                    steps = 4
+                )
             }
         },
         confirmButton = {
             Button(
                 onClick = {
                     if (title.isNotBlank()) {
+                        val base = initialReminder ?: ReminderEntity(title = title.trim())
                         onSave(
-                            ReminderEntity(
+                            base.copy(
                                 title = title.trim(),
                                 category = category,
-                                intervalMinutes = intervalMinutes,
+                                frequency = frequency,
+                                intervalMinutes = intervalMinutes.coerceAtLeast(5),
+                                startHour = startHour,
+                                startMinute = startMinute,
+                                endHour = endHour,
+                                endMinute = endMinute,
+                                specificHour = specificHour,
+                                specificMinute = specificMinute,
                                 snoozeMinutes = snoozeMinutes,
                                 isEnabled = true
                             )
@@ -636,7 +887,7 @@ fun CreateReminderDialog(
                 enabled = title.isNotBlank(),
                 shape = RoundedCornerShape(12.dp)
             ) {
-                Text("Create Reminder")
+                Text(if (initialReminder == null) "Create Reminder" else "Save Changes")
             }
         },
         dismissButton = {
@@ -646,19 +897,23 @@ fun CreateReminderDialog(
 }
 
 @Composable
-fun CreateHabitDialog(
+fun HabitEditorDialog(
+    initialHabit: HabitEntity?,
     onDismiss: () -> Unit,
     onSave: (HabitEntity) -> Unit
 ) {
-    var name by remember { mutableStateOf("") }
-    var category by remember { mutableStateOf("Health") }
-    var targetDays by remember { mutableStateOf(7) }
+    var name by remember { mutableStateOf(initialHabit?.name ?: "") }
+    var description by remember { mutableStateOf(initialHabit?.description ?: "") }
+    var category by remember { mutableStateOf(initialHabit?.category ?: "Health") }
+    var targetDays by remember { mutableStateOf(initialHabit?.targetDaysPerWeek ?: 7) }
+    var reminderHour by remember { mutableStateOf(initialHabit?.reminderHour ?: 9) }
+    var reminderMinute by remember { mutableStateOf(initialHabit?.reminderMinute ?: 0) }
 
     val categories = listOf("Health", "Study", "Mind", "Fitness", "Digital")
 
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text("Create Daily Habit", fontWeight = FontWeight.Bold) },
+        title = { Text(if (initialHabit == null) "Create Daily Habit" else "Edit Habit", fontWeight = FontWeight.Bold) },
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                 OutlinedTextField(
@@ -668,6 +923,15 @@ fun CreateHabitDialog(
                     placeholder = { Text("e.g. Read for 20 minutes") },
                     shape = RoundedCornerShape(12.dp),
                     modifier = Modifier.fillMaxWidth().testTag("habit_name_input")
+                )
+
+                OutlinedTextField(
+                    value = description,
+                    onValueChange = { description = it },
+                    label = { Text("Description / Note") },
+                    placeholder = { Text("e.g. Chapter 1-3") },
+                    shape = RoundedCornerShape(12.dp),
+                    modifier = Modifier.fillMaxWidth()
                 )
 
                 Text("Category:", style = MaterialTheme.typography.labelMedium)
@@ -689,17 +953,34 @@ fun CreateHabitDialog(
                     valueRange = 1f..7f,
                     steps = 5
                 )
+
+                OutlinedTextField(
+                    value = String.format("%02d:%02d", reminderHour, reminderMinute),
+                    onValueChange = {
+                        val parts = it.split(":")
+                        if (parts.size == 2) {
+                            reminderHour = (parts[0].toIntOrNull() ?: reminderHour).coerceIn(0, 23)
+                            reminderMinute = (parts[1].toIntOrNull() ?: reminderMinute).coerceIn(0, 59)
+                        }
+                    },
+                    label = { Text("Daily Reminder Time (HH:MM)") },
+                    modifier = Modifier.fillMaxWidth()
+                )
             }
         },
         confirmButton = {
             Button(
                 onClick = {
                     if (name.isNotBlank()) {
+                        val base = initialHabit ?: HabitEntity(name = name.trim())
                         onSave(
-                            HabitEntity(
+                            base.copy(
                                 name = name.trim(),
+                                description = description.trim(),
                                 category = category,
-                                targetDaysPerWeek = targetDays
+                                targetDaysPerWeek = targetDays,
+                                reminderHour = reminderHour,
+                                reminderMinute = reminderMinute
                             )
                         )
                     }
@@ -707,7 +988,7 @@ fun CreateHabitDialog(
                 enabled = name.isNotBlank(),
                 shape = RoundedCornerShape(12.dp)
             ) {
-                Text("Create Habit")
+                Text(if (initialHabit == null) "Create Habit" else "Save Changes")
             }
         },
         dismissButton = {

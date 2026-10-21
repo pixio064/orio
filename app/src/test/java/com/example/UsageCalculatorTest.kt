@@ -148,8 +148,9 @@ class UsageCalculatorTest {
         assertEquals(0L, result.totalScreenOnMs)
         assertTrue(result.appUsages.isEmpty())
         assertTrue(result.screenSessions.isEmpty())
-        assertTrue(result.lastTwoAppsBeforeLock.isEmpty())
-        assertTrue(result.inactivityGaps.isEmpty())
+        // Per Item 9, screen-off time is counted as phone-free rest period
+        assertEquals(1, result.inactivityGaps.size)
+        assertEquals(dayEndMs - dayStartMs, result.inactivityGaps.first().durationMs)
     }
 
     @Test

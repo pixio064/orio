@@ -6,6 +6,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -33,119 +34,181 @@ import com.example.data.local.entity.TaskPriority
 import com.example.data.local.entity.TaskType
 import com.example.scheduler.AlarmScheduler
 import com.example.ui.components.EmptyStateCard
+import com.example.util.DateKeys
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
-import java.text.SimpleDateFormat
-import java.util.*
+import java.util.Calendar
 
 data class PlannerUiState(
-    val selectedDate: String = "", // "YYYY-MM-DD"
+    val selectedDate: String = "",
     val isTomorrow: Boolean = false,
     val tasks: List<TaskEntity> = emptyList(),
     val conflictTaskIds: Set<Long> = emptySet(),
-    val isLoading: Boolean = true
+    val isLoading: Boolean = true,
+    val errorMessage: String? = null
 )
 
 class PlannerViewModel : ViewModel() {
     private val _uiState = MutableStateFlow(PlannerUiState())
     val uiState: StateFlow<PlannerUiState> = _uiState.asStateFlow()
 
-    private val dateFormat = SimpleDateFormat("yyyy-MM-dd", Locale.getDefault())
+    private var loadJob: Job? = null
 
-    fun initDate() {
-        val today = dateFormat.format(Date())
-        _uiState.value = _uiState.value.copy(selectedDate = today, isTomorrow = false)
+    fun checkAndRefreshDate(context: Context) {
+        val today = DateKeys.today()
+        val current = _uiState.value.selectedDate
+        if (current.isBlank() || (current != today && !_uiState.value.isTomorrow)) {
+            _uiState.update { it.copy(selectedDate = today, isTomorrow = false) }
+            loadTasks(context, today)
+        }
     }
 
     fun setDate(date: String, isTomorrow: Boolean, context: Context) {
-        _uiState.value = _uiState.value.copy(selectedDate = date, isTomorrow = isTomorrow)
+        _uiState.update { it.copy(selectedDate = date, isTomorrow = isTomorrow) }
         loadTasks(context, date)
     }
 
     fun loadTasks(context: Context, date: String = _uiState.value.selectedDate) {
-        viewModelScope.launch(Dispatchers.IO) {
-            val app = context.applicationContext as FocusTrackApp
-            val taskList = app.database.taskDao().getTasksForDateSync(date)
+        loadJob?.cancel()
+        loadJob = viewModelScope.launch(Dispatchers.IO) {
+            try {
+                _uiState.update { it.copy(isLoading = true, errorMessage = null) }
+                val targetDate = if (date.isNotBlank()) date else DateKeys.today()
+                val app = context.applicationContext as FocusTrackApp
+                val taskList = app.database.taskDao().getTasksForDateSync(targetDate)
 
-            // Detect conflicts for scheduled tasks
-            val conflicts = mutableSetOf<Long>()
-            val scheduled = taskList.filter { it.taskType == TaskType.SCHEDULED && it.outcome == TaskOutcome.PENDING }
-            for (i in scheduled.indices) {
-                for (j in i + 1 until scheduled.size) {
-                    val a = scheduled[i]
-                    val b = scheduled[j]
-                    val aStart = a.startTimeHour * 60 + a.startTimeMinute
-                    val aEnd = a.endTimeHour * 60 + a.endTimeMinute
-                    val bStart = b.startTimeHour * 60 + b.startTimeMinute
-                    val bEnd = b.endTimeHour * 60 + b.endTimeMinute
+                // Detect overlaps between scheduled pending tasks
+                val conflicts = mutableSetOf<Long>()
+                val scheduled = taskList.filter { it.taskType == TaskType.SCHEDULED && it.outcome == TaskOutcome.PENDING }
+                for (i in scheduled.indices) {
+                    for (j in i + 1 until scheduled.size) {
+                        val a = scheduled[i]
+                        val b = scheduled[j]
+                        val aStart = a.startTimeHour * 60 + a.startTimeMinute
+                        var aEnd = a.endTimeHour * 60 + a.endTimeMinute
+                        if (aEnd <= aStart) aEnd += 24 * 60 // Overnight handling
 
-                    if (aStart < bEnd && bStart < aEnd) {
-                        conflicts.add(a.id)
-                        conflicts.add(b.id)
+                        val bStart = b.startTimeHour * 60 + b.startTimeMinute
+                        var bEnd = b.endTimeHour * 60 + b.endTimeMinute
+                        if (bEnd <= bStart) bEnd += 24 * 60 // Overnight handling
+
+                        if (aStart < bEnd && bStart < aEnd) {
+                            conflicts.add(a.id)
+                            conflicts.add(b.id)
+                        }
                     }
                 }
-            }
 
-            _uiState.value = _uiState.value.copy(
-                tasks = taskList,
-                conflictTaskIds = conflicts,
-                isLoading = false
-            )
+                _uiState.update {
+                    it.copy(
+                        selectedDate = targetDate,
+                        tasks = taskList,
+                        conflictTaskIds = conflicts,
+                        isLoading = false
+                    )
+                }
+            } catch (e: Throwable) {
+                _uiState.update { it.copy(isLoading = false, errorMessage = e.message) }
+            }
         }
     }
 
     fun saveTask(context: Context, task: TaskEntity) {
         viewModelScope.launch(Dispatchers.IO) {
-            val app = context.applicationContext as FocusTrackApp
-            val id = app.database.taskDao().insertTask(task)
-            val savedTask = if (task.id == 0L) task.copy(id = id) else task
-            AlarmScheduler.scheduleTask(context, savedTask)
-            loadTasks(context)
+            try {
+                val app = context.applicationContext as FocusTrackApp
+                val id = app.database.taskDao().insertTask(task)
+                val savedTask = if (task.id == 0L) task.copy(id = id) else task
+
+                // Calculate if trigger time is in future or if reminder is enabled
+                val cal = Calendar.getInstance().apply {
+                    val parts = savedTask.dateString.split("-")
+                    if (parts.size == 3) {
+                        set(Calendar.YEAR, parts[0].toInt())
+                        set(Calendar.MONTH, parts[1].toInt() - 1)
+                        set(Calendar.DAY_OF_MONTH, parts[2].toInt())
+                    }
+                    set(Calendar.HOUR_OF_DAY, savedTask.startTimeHour)
+                    set(Calendar.MINUTE, savedTask.startTimeMinute)
+                    set(Calendar.SECOND, 0)
+                    set(Calendar.MILLISECOND, 0)
+                    add(Calendar.MINUTE, -savedTask.reminderMinutesBefore)
+                }
+
+                if (savedTask.reminderMinutesBefore >= 0 &&
+                    savedTask.outcome == TaskOutcome.PENDING &&
+                    cal.timeInMillis > System.currentTimeMillis()
+                ) {
+                    AlarmScheduler.scheduleTask(context, savedTask)
+                } else {
+                    AlarmScheduler.cancelTask(context, savedTask.id)
+                }
+                loadTasks(context)
+            } catch (_: Throwable) {}
         }
     }
 
     fun updateTaskOutcome(context: Context, taskId: Long, outcome: TaskOutcome) {
         viewModelScope.launch(Dispatchers.IO) {
-            val app = context.applicationContext as FocusTrackApp
-            app.database.taskDao().updateTaskOutcome(taskId, outcome, System.currentTimeMillis())
-            loadTasks(context)
+            try {
+                val app = context.applicationContext as FocusTrackApp
+                app.database.taskDao().updateTaskOutcome(taskId, outcome, System.currentTimeMillis())
+
+                // Cancel the alarm if completed, skipped, or missed
+                if (outcome != TaskOutcome.PENDING) {
+                    AlarmScheduler.cancelTask(context, taskId)
+                }
+                loadTasks(context)
+            } catch (_: Throwable) {}
         }
     }
 
     fun deleteTask(context: Context, task: TaskEntity) {
         viewModelScope.launch(Dispatchers.IO) {
-            val app = context.applicationContext as FocusTrackApp
-            app.database.taskDao().deleteTask(task)
-            AlarmScheduler.cancelTask(context, task.id)
-            loadTasks(context)
+            try {
+                val app = context.applicationContext as FocusTrackApp
+                app.database.taskDao().deleteTask(task)
+                AlarmScheduler.cancelTask(context, task.id)
+                loadTasks(context)
+            } catch (_: Throwable) {}
         }
     }
 
     fun carryOverUnfinishedToTomorrow(context: Context) {
         viewModelScope.launch(Dispatchers.IO) {
-            val app = context.applicationContext as FocusTrackApp
-            val today = dateFormat.format(Date())
-            val tomorrowCal = Calendar.getInstance().apply { add(Calendar.DAY_OF_YEAR, 1) }
-            val tomorrowStr = dateFormat.format(tomorrowCal.time)
+            try {
+                val app = context.applicationContext as FocusTrackApp
+                val today = DateKeys.today()
+                val tomorrow = DateKeys.tomorrow()
 
-            val todayTasks = app.database.taskDao().getTasksForDateSync(today)
-            val unfinished = todayTasks.filter { it.outcome == TaskOutcome.PENDING || it.outcome == TaskOutcome.MISSED }
+                val todayTasks = app.database.taskDao().getTasksForDateSync(today)
+                val unfinished = todayTasks.filter { it.outcome == TaskOutcome.PENDING || it.outcome == TaskOutcome.MISSED }
 
-            for (task in unfinished) {
-                val carried = task.copy(
-                    id = 0,
-                    dateString = tomorrowStr,
-                    outcome = TaskOutcome.PENDING,
-                    outcomeTimestamp = 0L
-                )
-                val id = app.database.taskDao().insertTask(carried)
-                AlarmScheduler.scheduleTask(context, carried.copy(id = id))
-            }
+                for (task in unfinished) {
+                    // Mark original as CARRIED so duplicates cannot be created if pressed twice
+                    app.database.taskDao().updateTaskOutcome(task.id, TaskOutcome.CARRIED, System.currentTimeMillis())
+                    AlarmScheduler.cancelTask(context, task.id)
 
-            setDate(tomorrowStr, isTomorrow = true, context = context)
+                    val carried = task.copy(
+                        id = 0,
+                        dateString = tomorrow,
+                        outcome = TaskOutcome.PENDING,
+                        outcomeTimestamp = 0L
+                    )
+                    val id = app.database.taskDao().insertTask(carried)
+                    val savedNew = carried.copy(id = id)
+                    if (savedNew.reminderMinutesBefore >= 0) {
+                        AlarmScheduler.scheduleTask(context, savedNew)
+                    }
+                }
+
+                setDate(tomorrow, isTomorrow = true, context = context)
+            } catch (_: Throwable) {}
         }
     }
 }
@@ -159,40 +222,45 @@ fun PlannerScreen(
     val context = LocalContext.current
     val uiState by viewModel.uiState.collectAsState()
 
-    var showCreateDialog by remember { mutableStateOf(false) }
-    var taskToEdit by remember { mutableStateOf<TaskEntity?>(null) }
+    var showEditDialog by remember { mutableStateOf(false) }
+    var selectedTaskForEdit by remember { mutableStateOf<TaskEntity?>(null) }
 
-    val dateFormat = remember { SimpleDateFormat("yyyy-MM-dd", Locale.getDefault()) }
-    val todayStr = remember { dateFormat.format(Date()) }
-    val tomorrowCal = remember { Calendar.getInstance().apply { add(Calendar.DAY_OF_YEAR, 1) } }
-    val tomorrowStr = remember { dateFormat.format(tomorrowCal.time) }
+    val todayStr = DateKeys.today()
+    val tomorrowStr = DateKeys.tomorrow()
 
+    // Automatically refresh date after midnight
     LaunchedEffect(Unit) {
-        if (uiState.selectedDate.isEmpty()) {
-            viewModel.initDate()
-        }
-        viewModel.loadTasks(context)
+        viewModel.checkAndRefreshDate(context)
     }
 
     Scaffold(
         topBar = {
             TopAppBar(
                 title = {
-                    Text(
-                        text = if (uiState.isTomorrow) "Tomorrow's Planner 🌙" else "Today's Schedule 📋",
-                        style = MaterialTheme.typography.titleLarge,
-                        fontWeight = FontWeight.Bold
-                    )
+                    Column {
+                        Text(
+                            text = "Daily Planner & Intentions",
+                            style = MaterialTheme.typography.titleLarge,
+                            fontWeight = FontWeight.Bold
+                        )
+                        Text(
+                            text = if (uiState.isTomorrow) "Planning for Tomorrow ($tomorrowStr)" else "Today's Agenda ($todayStr)",
+                            style = MaterialTheme.typography.labelMedium,
+                            color = MaterialTheme.colorScheme.primary
+                        )
+                    }
                 },
                 actions = {
-                    FilledTonalButton(
-                        onClick = { viewModel.carryOverUnfinishedToTomorrow(context) },
-                        shape = RoundedCornerShape(12.dp),
-                        modifier = Modifier.padding(end = 8.dp).testTag("carry_over_btn")
-                    ) {
-                        Icon(Icons.Default.ArrowForward, contentDescription = null, modifier = Modifier.size(16.dp))
-                        Spacer(modifier = Modifier.width(4.dp))
-                        Text("Carry to Tomorrow", style = MaterialTheme.typography.labelSmall)
+                    if (!uiState.isTomorrow) {
+                        FilledTonalButton(
+                            onClick = { viewModel.carryOverUnfinishedToTomorrow(context) },
+                            shape = RoundedCornerShape(12.dp),
+                            modifier = Modifier.padding(end = 8.dp).testTag("carry_over_btn")
+                        ) {
+                            Icon(Icons.Default.FastForward, contentDescription = "Carry Over Icon", modifier = Modifier.size(16.dp))
+                            Spacer(modifier = Modifier.width(4.dp))
+                            Text("Carry Over", style = MaterialTheme.typography.labelSmall)
+                        }
                     }
                 },
                 colors = TopAppBarDefaults.topAppBarColors(
@@ -203,8 +271,8 @@ fun PlannerScreen(
         floatingActionButton = {
             FloatingActionButton(
                 onClick = {
-                    taskToEdit = null
-                    showCreateDialog = true
+                    selectedTaskForEdit = null
+                    showEditDialog = true
                 },
                 containerColor = MaterialTheme.colorScheme.primary,
                 contentColor = MaterialTheme.colorScheme.onPrimary,
@@ -221,7 +289,7 @@ fun PlannerScreen(
                 .fillMaxSize()
                 .padding(innerPadding)
         ) {
-            // Day Switcher (Today vs Tomorrow)
+            // Day selector chips (Today / Tomorrow)
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -231,40 +299,49 @@ fun PlannerScreen(
                 FilterChip(
                     selected = !uiState.isTomorrow,
                     onClick = { viewModel.setDate(todayStr, isTomorrow = false, context = context) },
-                    label = { Text("Today (${SimpleDateFormat("MMM d", Locale.getDefault()).format(Date())})") },
-                    shape = RoundedCornerShape(12.dp),
+                    label = { Text("Today ($todayStr)") },
+                    leadingIcon = {
+                        if (!uiState.isTomorrow) {
+                            Icon(Icons.Default.Check, contentDescription = "Selected", modifier = Modifier.size(16.dp))
+                        }
+                    },
                     modifier = Modifier.weight(1f).testTag("chip_today")
                 )
                 FilterChip(
                     selected = uiState.isTomorrow,
                     onClick = { viewModel.setDate(tomorrowStr, isTomorrow = true, context = context) },
-                    label = { Text("Tomorrow (${SimpleDateFormat("MMM d", Locale.getDefault()).format(tomorrowCal.time)})") },
-                    shape = RoundedCornerShape(12.dp),
+                    label = { Text("Tomorrow ($tomorrowStr)") },
+                    leadingIcon = {
+                        if (uiState.isTomorrow) {
+                            Icon(Icons.Default.Check, contentDescription = "Selected", modifier = Modifier.size(16.dp))
+                        }
+                    },
                     modifier = Modifier.weight(1f).testTag("chip_tomorrow")
                 )
             }
 
-            // Conflict Warning Banner
+            // Conflict Warning Banner if overlaps exist
             if (uiState.conflictTaskIds.isNotEmpty()) {
-                Card(
-                    shape = RoundedCornerShape(16.dp),
-                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.errorContainer),
+                Surface(
+                    color = MaterialTheme.colorScheme.errorContainer,
+                    shape = RoundedCornerShape(12.dp),
                     modifier = Modifier
                         .fillMaxWidth()
                         .padding(horizontal = 16.dp, vertical = 4.dp)
                 ) {
                     Row(
-                        verticalAlignment = Alignment.CenterVertically,
-                        modifier = Modifier.padding(14.dp)
+                        modifier = Modifier.padding(12.dp),
+                        verticalAlignment = Alignment.CenterVertically
                     ) {
                         Icon(
                             imageVector = Icons.Default.Warning,
-                            contentDescription = null,
-                            tint = MaterialTheme.colorScheme.error
+                            contentDescription = "Conflict Warning",
+                            tint = MaterialTheme.colorScheme.error,
+                            modifier = Modifier.size(20.dp)
                         )
-                        Spacer(modifier = Modifier.width(12.dp))
+                        Spacer(modifier = Modifier.width(8.dp))
                         Text(
-                            text = "Schedule Conflict Detected: Two or more scheduled tasks overlap in time.",
+                            text = "Schedule Conflict: ${uiState.conflictTaskIds.size} tasks have overlapping time slots.",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onErrorContainer
                         )
@@ -275,34 +352,34 @@ fun PlannerScreen(
             // Task List
             LazyColumn(
                 contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 8.dp, bottom = 80.dp),
-                verticalArrangement = Arrangement.spacedBy(12.dp),
+                verticalArrangement = Arrangement.spacedBy(10.dp),
                 modifier = Modifier.fillMaxSize()
             ) {
                 if (uiState.tasks.isEmpty()) {
                     item {
                         EmptyStateCard(
-                            title = if (uiState.isTomorrow) "No Tasks Planned for Tomorrow" else "No Tasks for Today",
-                            description = "Tap '+' below to add a scheduled time-block or a flexible checklist task.",
+                            title = if (uiState.isTomorrow) "No Tasks Planned for Tomorrow" else "No Tasks Planned for Today",
+                            description = "Tap '+' below to plan intentional time blocks and build your focus.",
                             icon = Icons.Outlined.Checklist,
                             actionText = "Add First Task",
                             onActionClick = {
-                                taskToEdit = null
-                                showCreateDialog = true
+                                selectedTaskForEdit = null
+                                showEditDialog = true
                             }
                         )
                     }
                 } else {
                     items(uiState.tasks, key = { it.id }) { task ->
                         val hasConflict = uiState.conflictTaskIds.contains(task.id)
-                        TaskItemCard(
+                        TaskCardItem(
                             task = task,
                             hasConflict = hasConflict,
-                            onOutcomeChanged = { outcome ->
+                            onOutcomeChange = { outcome ->
                                 viewModel.updateTaskOutcome(context, task.id, outcome)
                             },
                             onEdit = {
-                                taskToEdit = task
-                                showCreateDialog = true
+                                selectedTaskForEdit = task
+                                showEditDialog = true
                             },
                             onDelete = {
                                 viewModel.deleteTask(context, task)
@@ -314,152 +391,142 @@ fun PlannerScreen(
         }
     }
 
-    // Task Creation / Editing Dialog
-    if (showCreateDialog) {
+    if (showEditDialog) {
         TaskEditDialog(
-            existingTask = taskToEdit,
-            defaultDate = uiState.selectedDate,
-            onDismiss = { showCreateDialog = false },
+            existingTask = selectedTaskForEdit,
+            defaultDate = if (uiState.isTomorrow) tomorrowStr else todayStr,
+            existingTasksOnDate = uiState.tasks.filter { it.id != (selectedTaskForEdit?.id ?: 0L) },
+            onDismiss = {
+                showEditDialog = false
+                selectedTaskForEdit = null
+            },
             onSave = { task ->
                 viewModel.saveTask(context, task)
-                showCreateDialog = false
+                showEditDialog = false
+                selectedTaskForEdit = null
             }
         )
     }
 }
 
 @Composable
-fun TaskItemCard(
+fun TaskCardItem(
     task: TaskEntity,
     hasConflict: Boolean,
-    onOutcomeChanged: (TaskOutcome) -> Unit,
+    onOutcomeChange: (TaskOutcome) -> Unit,
     onEdit: () -> Unit,
     onDelete: () -> Unit
 ) {
-    val isCompleted = task.outcome == TaskOutcome.COMPLETED
-    val isMissed = task.outcome == TaskOutcome.MISSED
+    val isDone = task.outcome == TaskOutcome.COMPLETED
     val isSkipped = task.outcome == TaskOutcome.SKIPPED
-
-    val cardColor = when {
-        isCompleted -> MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f)
-        hasConflict -> MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.3f)
-        else -> MaterialTheme.colorScheme.surface
-    }
+    val isMissed = task.outcome == TaskOutcome.MISSED
+    val isCarried = task.outcome == TaskOutcome.CARRIED
 
     Card(
-        shape = RoundedCornerShape(20.dp),
-        colors = CardDefaults.cardColors(containerColor = cardColor),
-        elevation = CardDefaults.cardElevation(defaultElevation = if (isCompleted) 0.dp else 2.dp),
+        shape = RoundedCornerShape(18.dp),
+        colors = CardDefaults.cardColors(
+            containerColor = when {
+                hasConflict -> MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.35f)
+                isDone -> MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.4f)
+                isCarried -> MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.25f)
+                else -> MaterialTheme.colorScheme.surface
+            }
+        ),
         modifier = Modifier
             .fillMaxWidth()
             .testTag("task_card_${task.id}")
     ) {
-        Column(modifier = Modifier.padding(16.dp)) {
-            Row(
-                verticalAlignment = Alignment.CenterVertically,
-                modifier = Modifier.fillMaxWidth()
-            ) {
-                // Outcome Toggle Checkbox
+        Column(modifier = Modifier.padding(14.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
                 IconButton(
                     onClick = {
-                        val nextOutcome = if (isCompleted) TaskOutcome.PENDING else TaskOutcome.COMPLETED
-                        onOutcomeChanged(nextOutcome)
+                        val next = if (isDone) TaskOutcome.PENDING else TaskOutcome.COMPLETED
+                        onOutcomeChange(next)
                     },
-                    modifier = Modifier.size(36.dp).testTag("task_check_${task.id}")
+                    modifier = Modifier.size(48.dp).testTag("task_check_${task.id}")
                 ) {
                     Icon(
-                        imageVector = if (isCompleted) Icons.Default.CheckCircle else Icons.Outlined.RadioButtonUnchecked,
-                        contentDescription = "Toggle Complete",
-                        tint = if (isCompleted) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outline
+                        imageVector = if (isDone) Icons.Default.CheckCircle else Icons.Outlined.RadioButtonUnchecked,
+                        contentDescription = if (isDone) "Mark Pending" else "Mark Complete",
+                        tint = if (isDone) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outline,
+                        modifier = Modifier.size(28.dp)
                     )
                 }
 
-                Spacer(modifier = Modifier.width(8.dp))
+                Spacer(modifier = Modifier.width(6.dp))
 
-                Column(modifier = Modifier.weight(1f).clickable { onEdit() }) {
+                Column(modifier = Modifier.weight(1f)) {
                     Text(
                         text = task.title,
                         style = MaterialTheme.typography.titleMedium,
-                        fontWeight = FontWeight.SemiBold,
-                        textDecoration = if (isCompleted) TextDecoration.LineThrough else TextDecoration.None,
-                        color = if (isCompleted) MaterialTheme.colorScheme.onSurfaceVariant else MaterialTheme.colorScheme.onSurface
+                        fontWeight = FontWeight.Bold,
+                        textDecoration = if (isDone || isSkipped || isCarried) TextDecoration.LineThrough else TextDecoration.None
                     )
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        if (task.taskType == TaskType.SCHEDULED) {
-                            val startStr = String.format("%02d:%02d", task.startTimeHour, task.startTimeMinute)
-                            val endStr = String.format("%02d:%02d", task.endTimeHour, task.endTimeMinute)
-                            Text(
-                                text = "⏰ $startStr - $endStr",
-                                style = MaterialTheme.typography.bodySmall,
-                                fontWeight = FontWeight.Medium,
-                                color = MaterialTheme.colorScheme.primary
-                            )
-                            Text(text = " • ", style = MaterialTheme.typography.bodySmall)
-                        }
+
+                    if (task.description.isNotBlank()) {
                         Text(
-                            text = "${task.category} • ${task.priority.name}",
+                            text = task.description,
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
                     }
+
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        if (task.taskType == TaskType.SCHEDULED) {
+                            val timeText = "${String.format("%02d:%02d", task.startTimeHour, task.startTimeMinute)} - ${String.format("%02d:%02d", task.endTimeHour, task.endTimeMinute)}"
+                            Text(
+                                text = "⏰ $timeText",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.primary
+                            )
+                        } else {
+                            Text(
+                                text = "Flexible Item",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.secondary
+                            )
+                        }
+
+                        Text(
+                            text = "• ${task.priority.name} Priority",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = when (task.priority) {
+                                TaskPriority.URGENT -> MaterialTheme.colorScheme.error
+                                TaskPriority.HIGH -> Color(0xFFFF6F00)
+                                else -> MaterialTheme.colorScheme.outline
+                            }
+                        )
+
+                        if (isCarried) {
+                            Text(
+                                text = "• Carried Over",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.tertiary
+                            )
+                        }
+                    }
                 }
 
-                // Delete Button
-                IconButton(onClick = onDelete) {
-                    Icon(
-                        imageVector = Icons.Outlined.Delete,
-                        contentDescription = "Delete",
-                        tint = MaterialTheme.colorScheme.outline,
-                        modifier = Modifier.size(20.dp)
-                    )
+                IconButton(onClick = onEdit, modifier = Modifier.size(48.dp)) {
+                    Icon(Icons.Outlined.Edit, contentDescription = "Edit Task", tint = MaterialTheme.colorScheme.outline)
                 }
-            }
-
-            // Outcome Controls Row (Pending, Missed, Skipped)
-            Spacer(modifier = Modifier.height(10.dp))
-            Row(
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
-                verticalAlignment = Alignment.CenterVertically,
-                modifier = Modifier.fillMaxWidth()
-            ) {
-                Text(
-                    text = "Status: ",
-                    style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                )
-                AssistChip(
-                    onClick = { onOutcomeChanged(TaskOutcome.COMPLETED) },
-                    label = { Text("Done ✓") },
-                    colors = AssistChipDefaults.assistChipColors(
-                        containerColor = if (isCompleted) MaterialTheme.colorScheme.primaryContainer else Color.Transparent
-                    ),
-                    shape = RoundedCornerShape(8.dp)
-                )
-                AssistChip(
-                    onClick = { onOutcomeChanged(TaskOutcome.MISSED) },
-                    label = { Text("Missed ✗") },
-                    colors = AssistChipDefaults.assistChipColors(
-                        containerColor = if (isMissed) MaterialTheme.colorScheme.errorContainer else Color.Transparent
-                    ),
-                    shape = RoundedCornerShape(8.dp)
-                )
-                AssistChip(
-                    onClick = { onOutcomeChanged(TaskOutcome.SKIPPED) },
-                    label = { Text("Skip") },
-                    colors = AssistChipDefaults.assistChipColors(
-                        containerColor = if (isSkipped) MaterialTheme.colorScheme.surfaceVariant else Color.Transparent
-                    ),
-                    shape = RoundedCornerShape(8.dp)
-                )
+                IconButton(onClick = onDelete, modifier = Modifier.size(48.dp)) {
+                    Icon(Icons.Outlined.Delete, contentDescription = "Delete Task", tint = MaterialTheme.colorScheme.outline)
+                }
             }
         }
     }
 }
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun TaskEditDialog(
     existingTask: TaskEntity?,
     defaultDate: String,
+    existingTasksOnDate: List<TaskEntity>,
     onDismiss: () -> Unit,
     onSave: (TaskEntity) -> Unit
 ) {
@@ -475,6 +542,37 @@ fun TaskEditDialog(
     var reminderBefore by remember { mutableStateOf(existingTask?.reminderMinutesBefore ?: 10) }
 
     val categories = listOf("Work", "Study", "Health", "Personal", "Focus")
+    val reminderOptions = listOf(
+        -1 to "None",
+        0 to "At start",
+        5 to "5m before",
+        10 to "10m before",
+        30 to "30m before"
+    )
+
+    val startTotalMins = startHour * 60 + startMin
+    val endTotalMins = endHour * 60 + endMin
+    val isOvernight = taskType == TaskType.SCHEDULED && (endTotalMins <= startTotalMins)
+
+    // Check overlaps with other tasks on this date
+    val overlaps = remember(taskType, startHour, startMin, endHour, endMin) {
+        if (taskType != TaskType.SCHEDULED) emptyList()
+        else {
+            val aStart = startHour * 60 + startMin
+            var aEnd = endHour * 60 + endMin
+            if (aEnd <= aStart) aEnd += 24 * 60
+
+            existingTasksOnDate.filter { other ->
+                if (other.taskType != TaskType.SCHEDULED || other.outcome != TaskOutcome.PENDING) false
+                else {
+                    val bStart = other.startTimeHour * 60 + other.startTimeMinute
+                    var bEnd = other.endTimeHour * 60 + other.endTimeMinute
+                    if (bEnd <= bStart) bEnd += 24 * 60
+                    aStart < bEnd && bStart < aEnd
+                }
+            }
+        }
+    }
 
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -487,7 +585,7 @@ fun TaskEditDialog(
         },
         text = {
             Column(
-                verticalArrangement = Arrangement.spacedBy(12.dp),
+                verticalArrangement = Arrangement.spacedBy(10.dp),
                 modifier = Modifier.fillMaxWidth()
             ) {
                 OutlinedTextField(
@@ -498,6 +596,15 @@ fun TaskEditDialog(
                     singleLine = true,
                     shape = RoundedCornerShape(12.dp),
                     modifier = Modifier.fillMaxWidth().testTag("task_title_input")
+                )
+
+                OutlinedTextField(
+                    value = description,
+                    onValueChange = { description = it },
+                    label = { Text("Description / Notes") },
+                    placeholder = { Text("e.g. Chapter 4 exercises") },
+                    shape = RoundedCornerShape(12.dp),
+                    modifier = Modifier.fillMaxWidth()
                 )
 
                 // Task Type Selector
@@ -517,26 +624,100 @@ fun TaskEditDialog(
                 }
 
                 if (taskType == TaskType.SCHEDULED) {
-                    Text("Time: ${String.format("%02d:%02d", startHour, startMin)} to ${String.format("%02d:%02d", endHour, endMin)}", style = MaterialTheme.typography.bodyMedium)
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
-                        Button(
-                            onClick = {
-                                startHour = (startHour + 1) % 24
-                                endHour = (startHour + 1) % 24
+                    Text("Time Pickers (Minute Precision):", style = MaterialTheme.typography.labelMedium)
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        OutlinedTextField(
+                            value = String.format("%02d:%02d", startHour, startMin),
+                            onValueChange = {
+                                val parts = it.split(":")
+                                if (parts.size == 2) {
+                                    startHour = (parts[0].toIntOrNull() ?: startHour).coerceIn(0, 23)
+                                    startMin = (parts[1].toIntOrNull() ?: startMin).coerceIn(0, 59)
+                                }
                             },
-                            colors = ButtonDefaults.filledTonalButtonColors(),
+                            label = { Text("Start (HH:MM)") },
+                            modifier = Modifier.weight(1f).testTag("start_time_input")
+                        )
+                        OutlinedTextField(
+                            value = String.format("%02d:%02d", endHour, endMin),
+                            onValueChange = {
+                                val parts = it.split(":")
+                                if (parts.size == 2) {
+                                    endHour = (parts[0].toIntOrNull() ?: endHour).coerceIn(0, 23)
+                                    endMin = (parts[1].toIntOrNull() ?: endMin).coerceIn(0, 59)
+                                }
+                            },
+                            label = { Text("End (HH:MM)") },
+                            modifier = Modifier.weight(1f).testTag("end_time_input")
+                        )
+                    }
+
+                    if (isOvernight) {
+                        Surface(
+                            color = MaterialTheme.colorScheme.tertiaryContainer,
                             shape = RoundedCornerShape(8.dp),
-                            modifier = Modifier.weight(1f)
+                            modifier = Modifier.fillMaxWidth()
                         ) {
-                            Text("Shift Hour (+1h)")
+                            Text(
+                                text = "🌙 Overnight schedule (ends next morning)",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onTertiaryContainer,
+                                modifier = Modifier.padding(8.dp)
+                            )
                         }
+                    }
+
+                    if (overlaps.isNotEmpty()) {
+                        Surface(
+                            color = MaterialTheme.colorScheme.errorContainer,
+                            shape = RoundedCornerShape(8.dp),
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Text(
+                                text = "⚠️ Overlaps with '${overlaps.first().title}' (${String.format("%02d:%02d", overlaps.first().startTimeHour, overlaps.first().startTimeMinute)} - ${String.format("%02d:%02d", overlaps.first().endTimeHour, overlaps.first().endTimeMinute)})",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onErrorContainer,
+                                modifier = Modifier.padding(8.dp)
+                            )
+                        }
+                    }
+                }
+
+                // Priority Selector
+                Text("Priority:", style = MaterialTheme.typography.labelMedium)
+                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    TaskPriority.entries.forEach { p ->
+                        FilterChip(
+                            selected = priority == p,
+                            onClick = { priority = p },
+                            label = { Text(p.name, style = MaterialTheme.typography.labelSmall) },
+                            shape = RoundedCornerShape(8.dp)
+                        )
+                    }
+                }
+
+                // Reminder Before Selector
+                Text("Notification Reminder Before Start:", style = MaterialTheme.typography.labelMedium)
+                LazyRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    items(reminderOptions) { opt ->
+                        val mins = opt.first
+                        val label = opt.second
+                        FilterChip(
+                            selected = reminderBefore == mins,
+                            onClick = { reminderBefore = mins },
+                            label = { Text(label, style = MaterialTheme.typography.labelSmall) },
+                            shape = RoundedCornerShape(8.dp)
+                        )
                     }
                 }
 
                 // Category selection
                 Text("Category:", style = MaterialTheme.typography.labelMedium)
-                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                    categories.forEach { cat ->
+                LazyRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    items(categories) { cat ->
                         FilterChip(
                             selected = category == cat,
                             onClick = { category = cat },

@@ -5,8 +5,10 @@ import android.app.usage.UsageStatsManager
 import android.content.Context
 import android.content.pm.ApplicationInfo
 import android.content.pm.PackageManager
+import android.os.Build
 import android.util.Log
 import com.example.data.local.entity.HourlyNotificationCount
+import com.example.util.DateKeys
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.time.Instant
@@ -17,7 +19,8 @@ import java.util.Calendar
 data class RawEvent(
     val timestamp: Long,
     val eventType: Int,
-    val packageName: String
+    val packageName: String,
+    val className: String = ""
 )
 
 data class CalculatedAppUsage(
@@ -132,8 +135,7 @@ object UsageCalculator {
         }
 
         val usageStatsManager = context.getSystemService(Context.USAGE_STATS_SERVICE) as? UsageStatsManager
-        if (usageStatsManager == null) {
-            return CalculatedDayUsage(
+            ?: return CalculatedDayUsage(
                 date = date,
                 dayStartMs = dayStartMs,
                 dayEndMs = dayEndMs,
@@ -148,7 +150,6 @@ object UsageCalculator {
                 inactivityGaps = emptyList(),
                 hasPermission = false
             )
-        }
 
         // Effective end of day for querying: if today, clamp to current time
         val effectiveEndMs = if (isToday) minOf(currentTimeMs, dayEndMs) else dayEndMs
@@ -165,17 +166,20 @@ object UsageCalculator {
                 RawEvent(
                     timestamp = rawEvent.timeStamp,
                     eventType = rawEvent.eventType,
-                    packageName = rawEvent.packageName ?: ""
+                    packageName = rawEvent.packageName ?: "",
+                    className = rawEvent.className ?: ""
                 )
             )
         }
 
-        // Sort events chronologically to guarantee correct pairing
         rawEventsList.sortBy { it.timestamp }
 
         val pm = context.packageManager
+        val noiseCache = mutableMapOf<String, Boolean>()
+        val nameCache = mutableMapOf<String, String>()
+        val categoryCache = mutableMapOf<String, String>()
 
-        return computeFromEvents(
+        val result = computeFromEvents(
             rawEvents = rawEventsList,
             date = date,
             dayStartMs = dayStartMs,
@@ -183,15 +187,24 @@ object UsageCalculator {
             isToday = isToday,
             currentTimeMs = currentTimeMs,
             hasPermission = true,
-            isSystemNoiseCheck = { pkg -> UsageStatsHelper.isSystemNoise(context, pkg) },
-            appNameResolver = { pkg -> SessionsRepository.getCleanAppName(pm, pkg) },
-            categoryResolver = { pkg -> inferAppCategory(pkg, pm) }
+            isSystemNoiseCheck = { pkg ->
+                noiseCache.getOrPut(pkg) { UsageStatsHelper.isSystemNoise(context, pkg) }
+            },
+            appNameResolver = { pkg ->
+                nameCache.getOrPut(pkg) { SessionsRepository.getCleanAppName(pm, pkg) }
+            },
+            categoryResolver = { pkg ->
+                categoryCache.getOrPut(pkg) { inferAppCategory(pkg, pm) }
+            }
         )
+
+        return result
     }
 
     /**
-     * Pure function that calculates per-app usage and sessions from raw events.
-     * Easily unit testable without requiring Android system services or emulators.
+     * Pure function that calculates per-app usage, foreground time, transitions, and screen sessions.
+     * Transitions within the same package (e.g. PAUSED(A1) -> RESUMED(A2) -> STOPPED(A1))
+     * do not count as separate launches and do not truncate foreground duration.
      */
     fun computeFromEvents(
         rawEvents: List<RawEvent>,
@@ -216,13 +229,14 @@ object UsageCalculator {
         val reconstructedSessions = mutableListOf<DetailedSession>()
         val chronologicalAppsList = mutableListOf<Pair<String, Long>>()
 
+        // Track active foreground app and active activities per package
         var currentResumedPkg: String? = null
         var currentResumeTime: Long = -1L
+        val activeActivitiesByPkg = mutableMapOf<String, MutableSet<String>>()
 
         var screenInteractiveStart: Long = -1L
         var totalScreenOnMs: Long = 0L
         var lastLockTimestamp: Long = 0L
-        var lastUnlockTimestamp: Long = 0L
         var previousScreenOffTime: Long = dayStartMs
         var currentSessionApps = mutableListOf<String>()
 
@@ -232,7 +246,6 @@ object UsageCalculator {
         fun closeAppInterval(pkg: String, start: Long, end: Long) {
             if (end <= start || isSystemNoiseCheck(pkg)) return
 
-            // Clip interval strictly to [dayStartMs, dayEndMs]
             val clippedStart = maxOf(start, dayStartMs)
             val clippedEnd = minOf(end, dayEndMs)
             val duration = clippedEnd - clippedStart
@@ -240,7 +253,6 @@ object UsageCalculator {
             if (duration > 0) {
                 appForegroundTimes[pkg] = (appForegroundTimes[pkg] ?: 0L) + duration
 
-                // Distribute into 24 hourly buckets
                 val hourly = appHourlyTimes.getOrPut(pkg) { LongArray(24) { 0L } }
                 for (h in 0..23) {
                     val hStart = dayStartMs + (h * 3600_000L)
@@ -252,7 +264,6 @@ object UsageCalculator {
                     }
                 }
 
-                // Record session interval if at least 5 seconds
                 if (duration >= 5000L) {
                     val sessionsList = appSessions.getOrPut(pkg) { mutableListOf() }
                     sessionsList.add(AppSessionInterval(clippedStart, clippedEnd, duration))
@@ -260,61 +271,109 @@ object UsageCalculator {
             }
         }
 
-        for (event in rawEvents) {
+        val eventCount = rawEvents.size
+        for (i in 0 until eventCount) {
+            val event = rawEvents[i]
             val t = event.timestamp
             val pkg = event.packageName
+            val cls = event.className
 
             when (event.eventType) {
                 UsageEvents.Event.ACTIVITY_RESUMED -> {
                     if (pkg.isNotBlank() && !isSystemNoiseCheck(pkg)) {
-                        val isSameAppDuplicate = (currentResumedPkg == pkg)
+                        val activeSet = activeActivitiesByPkg.getOrPut(pkg) { mutableSetOf() }
+                        val isInternalTransition = (currentResumedPkg == pkg)
 
-                        // If another app was resumed without an explicit pause, close its session
-                        if (currentResumedPkg != null && currentResumedPkg != pkg) {
-                            closeAppInterval(currentResumedPkg!!, currentResumeTime, t)
-                            currentResumedPkg = pkg
-                            currentResumeTime = t
-                        } else if (currentResumedPkg == null) {
-                            currentResumedPkg = pkg
-                            currentResumeTime = t
+                        if (cls.isNotBlank()) {
+                            activeSet.add(cls)
                         }
 
-                        // Count launch if within the target day and not a duplicate resume of the currently active app
-                        if (!isSameAppDuplicate && t in dayStartMs..dayEndMs) {
-                            appLaunchCounts[pkg] = (appLaunchCounts[pkg] ?: 0) + 1
-                            val currentLast = appLastUsed[pkg] ?: 0L
-                            if (t > currentLast) appLastUsed[pkg] = t
-                            val currentFirst = appFirstUsed[pkg] ?: Long.MAX_VALUE
-                            if (t < currentFirst) appFirstUsed[pkg] = t
+                        if (!isInternalTransition) {
+                            // Switched from a different app
+                            if (currentResumedPkg != null) {
+                                closeAppInterval(currentResumedPkg!!, currentResumeTime, t)
+                                activeActivitiesByPkg[currentResumedPkg!!]?.clear()
+                            }
+                            currentResumedPkg = pkg
+                            currentResumeTime = t
 
-                            val appName = appNameResolver(pkg)
-                            timelineEvents.add(
-                                UsageTimelineEvent(
-                                    timestamp = t,
-                                    eventType = "APP_FOREGROUND",
-                                    description = "Opened $appName",
-                                    packageName = pkg,
-                                    appName = appName
+                            if (t in dayStartMs..dayEndMs) {
+                                appLaunchCounts[pkg] = (appLaunchCounts[pkg] ?: 0) + 1
+                                val currentLast = appLastUsed[pkg] ?: 0L
+                                if (t > currentLast) appLastUsed[pkg] = t
+                                val currentFirst = appFirstUsed[pkg] ?: Long.MAX_VALUE
+                                if (t < currentFirst) appFirstUsed[pkg] = t
+
+                                val appName = appNameResolver(pkg)
+                                timelineEvents.add(
+                                    UsageTimelineEvent(
+                                        timestamp = t,
+                                        eventType = "APP_FOREGROUND",
+                                        description = "Opened $appName",
+                                        packageName = pkg,
+                                        appName = appName
+                                    )
                                 )
-                            )
-                            currentSessionApps.add(pkg)
-                            chronologicalAppsList.add(Pair(pkg, t))
+                                currentSessionApps.add(pkg)
+                                chronologicalAppsList.add(Pair(pkg, t))
+                            }
+                        } else {
+                            // Same app internal transition: update last used timestamp without incrementing launchCount
+                            if (t in dayStartMs..dayEndMs) {
+                                val currentLast = appLastUsed[pkg] ?: 0L
+                                if (t > currentLast) appLastUsed[pkg] = t
+                            }
                         }
                     }
                 }
 
-                UsageEvents.Event.ACTIVITY_PAUSED,
-                UsageEvents.Event.ACTIVITY_STOPPED -> {
-                    if (currentResumedPkg != null && currentResumedPkg == pkg) {
-                        closeAppInterval(pkg, currentResumeTime, t)
-                        currentResumedPkg = null
-                        currentResumeTime = -1L
+                UsageEvents.Event.ACTIVITY_PAUSED -> {
+                    if (cls.isNotBlank()) {
+                        activeActivitiesByPkg[pkg]?.remove(cls)
+                    }
+                    if (currentResumedPkg == pkg) {
+                        // Check if the next event is an activity resume inside the same package (lookahead)
+                        val nextEvent = if (i + 1 < eventCount) rawEvents[i + 1] else null
+                        val willResumeSameApp = nextEvent != null &&
+                                nextEvent.packageName == pkg &&
+                                nextEvent.eventType == UsageEvents.Event.ACTIVITY_RESUMED &&
+                                (nextEvent.timestamp - t) < 3000L
+
+                        if (!willResumeSameApp) {
+                            val activeSet = activeActivitiesByPkg[pkg]
+                            if (activeSet.isNullOrEmpty()) {
+                                closeAppInterval(pkg, currentResumeTime, t)
+                                currentResumedPkg = null
+                                currentResumeTime = -1L
+                            }
+                        }
                     }
                 }
 
-                UsageEvents.Event.SCREEN_INTERACTIVE,
-                UsageEvents.Event.KEYGUARD_HIDDEN -> {
-                    lastUnlockTimestamp = t
+                UsageEvents.Event.ACTIVITY_STOPPED -> {
+                    if (cls.isNotBlank()) {
+                        activeActivitiesByPkg[pkg]?.remove(cls)
+                    }
+                    if (currentResumedPkg == pkg) {
+                        val activeSet = activeActivitiesByPkg[pkg]
+                        if (activeSet.isNullOrEmpty()) {
+                            closeAppInterval(pkg, currentResumeTime, t)
+                            currentResumedPkg = null
+                            currentResumeTime = -1L
+                        }
+                    }
+                }
+
+                UsageEvents.Event.SCREEN_INTERACTIVE -> {
+                    timelineEvents.add(
+                        UsageTimelineEvent(
+                            timestamp = t,
+                            eventType = "SCREEN_ON",
+                            description = "Screen turned on",
+                            packageName = "",
+                            appName = "Screen"
+                        )
+                    )
                     if (screenInteractiveStart == -1L) {
                         screenInteractiveStart = t
                         currentSessionApps = mutableListOf()
@@ -345,10 +404,37 @@ object UsageCalculator {
                     }
                 }
 
+                UsageEvents.Event.KEYGUARD_HIDDEN -> {
+                    timelineEvents.add(
+                        UsageTimelineEvent(
+                            timestamp = t,
+                            eventType = "SCREEN_UNLOCK",
+                            description = "Device unlocked",
+                            packageName = "",
+                            appName = "System"
+                        )
+                    )
+                    if (screenInteractiveStart == -1L) {
+                        screenInteractiveStart = t
+                        currentSessionApps = mutableListOf()
+                    }
+                }
+
                 UsageEvents.Event.SCREEN_NON_INTERACTIVE -> {
                     lastLockTimestamp = t
+                    timelineEvents.add(
+                        UsageTimelineEvent(
+                            timestamp = t,
+                            eventType = "SCREEN_OFF",
+                            description = "Screen locked / turned off",
+                            packageName = "",
+                            appName = "Screen"
+                        )
+                    )
+
                     if (currentResumedPkg != null) {
                         closeAppInterval(currentResumedPkg!!, currentResumeTime, t)
+                        activeActivitiesByPkg[currentResumedPkg!!]?.clear()
                         currentResumedPkg = null
                         currentResumeTime = -1L
                     }
@@ -375,7 +461,8 @@ object UsageCalculator {
                                         lastAppPackage = lastPkg,
                                         lastAppName = if (lastPkg.isNotBlank()) appNameResolver(lastPkg) else "None",
                                         precedingInactivityMs = inactBefore,
-                                        appsUsed = distinctApps
+                                        appsUsed = distinctApps,
+                                        isCurrentActive = false
                                     )
                                 )
                             }
@@ -394,7 +481,7 @@ object UsageCalculator {
             }
         }
 
-        // If app or screen is still ongoing at query time
+        // Close ongoing app session at current time / day end
         if (currentResumedPkg != null) {
             val endPoint = if (isToday) currentTimeMs else dayEndMs
             closeAppInterval(currentResumedPkg!!, currentResumeTime, endPoint)
@@ -405,12 +492,56 @@ object UsageCalculator {
             }
         }
 
+        // Handle active ongoing screen session (Item 7)
         if (screenInteractiveStart != -1L) {
             val endPoint = if (isToday) currentTimeMs else dayEndMs
             val clippedOnStart = maxOf(screenInteractiveStart, dayStartMs)
             val clippedOnEnd = minOf(endPoint, dayEndMs)
-            if (clippedOnEnd > clippedOnStart) {
-                totalScreenOnMs += (clippedOnEnd - clippedOnStart)
+            val liveDur = (clippedOnEnd - clippedOnStart).coerceAtLeast(0L)
+            if (liveDur > 0) {
+                totalScreenOnMs += liveDur
+            }
+
+            if (isToday) {
+                val inactBefore = (screenInteractiveStart - previousScreenOffTime).coerceAtLeast(0L)
+                val distinctApps = currentSessionApps.distinct().map { appNameResolver(it) }
+                val lastPkg = currentSessionApps.lastOrNull() ?: currentResumedPkg ?: ""
+                reconstructedSessions.add(
+                    DetailedSession(
+                        id = screenInteractiveStart,
+                        startTimestamp = screenInteractiveStart,
+                        endTimestamp = currentTimeMs,
+                        durationMs = (currentTimeMs - screenInteractiveStart).coerceAtLeast(0L),
+                        lastAppPackage = lastPkg,
+                        lastAppName = if (lastPkg.isNotBlank()) appNameResolver(lastPkg) else "Active",
+                        precedingInactivityMs = inactBefore,
+                        appsUsed = distinctApps,
+                        isCurrentActive = true
+                    )
+                )
+            }
+        } else if (previousScreenOffTime > 0L) {
+            // Screen is currently off: calculate trailing screen-off break gap (Item 9)
+            val trailingEnd = if (isToday) currentTimeMs else dayEndMs
+            val gapStart = maxOf(dayStartMs, previousScreenOffTime)
+            val gapEnd = minOf(trailingEnd, dayEndMs)
+            val gapDur = gapEnd - gapStart
+            if (gapDur >= 3 * 60 * 1000L) {
+                val gapLabel = when {
+                    gapDur >= 4 * 3600 * 1000L -> "Overnight Sleep & Deep Rest"
+                    gapDur >= 90 * 60 * 1000L -> "Extended Phone-Free Interval"
+                    gapDur >= 45 * 60 * 1000L -> "Midday Rest Break"
+                    else -> "Screen-Off Rest Pause"
+                }
+                detectedInactivityGaps.add(
+                    InactivityRestGap(
+                        id = gapStart,
+                        startTimestamp = gapStart,
+                        endTimestamp = gapEnd,
+                        durationMs = gapDur,
+                        label = gapLabel
+                    )
+                )
             }
         }
 
@@ -444,7 +575,6 @@ object UsageCalculator {
 
         resultApps.sortByDescending { it.totalTimeInForegroundMs }
 
-        // If total screen on time from events is 0, fall back to sum of app times
         if (totalScreenOnMs == 0L && resultApps.isNotEmpty()) {
             totalScreenOnMs = resultApps.sumOf { it.totalTimeInForegroundMs }
         }
@@ -466,12 +596,6 @@ object UsageCalculator {
             )
         }
 
-        // Tag "UsageCalc" log for verification on real devices
-        logD(TAG, "Date: $date | Range: [${Instant.ofEpochMilli(dayStartMs)} - ${Instant.ofEpochMilli(dayEndMs)}] | Raw Events: ${rawEvents.size} | Total Screen On: ${totalScreenOnMs / 1000}s | Distinct Apps: ${resultApps.size}")
-        resultApps.forEach { app ->
-            logD(TAG, "  -> ${app.packageName} (${app.appName}): ${app.totalTimeInForegroundMs / 1000}s, launches: ${app.launchCount}")
-        }
-
         return CalculatedDayUsage(
             date = date,
             dayStartMs = dayStartMs,
@@ -489,9 +613,6 @@ object UsageCalculator {
         )
     }
 
-    /**
-     * Suspend calculation for a single application's 24-hour detailed screen time and notification counts.
-     */
     suspend fun calculateAppUsage(
         context: Context,
         packageName: String,
@@ -503,18 +624,14 @@ object UsageCalculator {
             calendar.get(Calendar.MONTH) + 1,
             calendar.get(Calendar.DAY_OF_MONTH)
         )
-        val dateFormat = java.text.SimpleDateFormat("yyyy-MM-dd", java.util.Locale.getDefault())
-        val dateString = dateFormat.format(calendar.time)
+        val dateString = DateKeys.format(calendar.time)
         val pm = context.packageManager
         val appName = SessionsRepository.getCleanAppName(pm, packageName)
-        val appIcon = try { pm.getApplicationIcon(packageName) } catch (e: Exception) { null }
 
         val hasUsagePermission = UsageStatsHelper.hasUsageStatsPermission(context)
         val hasNotificationAccess = com.example.notification.AppNotificationListenerService.isNotificationAccessGranted(context)
 
-        // If future date, return 0 usage immediately
         if (isFutureDate(date, zoneId)) {
-            logD(TAG, "calculateAppUsage: Future date $dateString requested for $packageName. Returning 0.")
             return@withContext AppHourlyUsageData(
                 packageName = packageName,
                 appName = appName,
@@ -529,12 +646,11 @@ object UsageCalculator {
                 hasRealUsageData = false,
                 hasNotificationAccess = hasNotificationAccess,
                 detectedSessions = emptyList(),
-                appIcon = appIcon
+                appIcon = null
             )
         }
 
         if (!hasUsagePermission) {
-            logD(TAG, "calculateAppUsage: No usage permission for $packageName.")
             return@withContext AppHourlyUsageData(
                 packageName = packageName,
                 appName = appName,
@@ -549,16 +665,14 @@ object UsageCalculator {
                 hasRealUsageData = false,
                 hasNotificationAccess = hasNotificationAccess,
                 detectedSessions = emptyList(),
-                appIcon = appIcon
+                appIcon = null
             )
         }
 
-        // Calculate single source of truth for the day
         val dayUsage = calculateDayUsage(context, date, zoneId)
         val appStats = dayUsage.appUsages.find { it.packageName == packageName }
 
         val hourlyNotifications = IntArray(24) { 0 }
-        // Fetch notifications from Room
         if (hasNotificationAccess) {
             try {
                 val app = context.applicationContext as? com.example.FocusTrackApp
@@ -570,9 +684,7 @@ object UsageCalculator {
                         }
                     }
                 }
-            } catch (e: Exception) {
-                logW(TAG, "Failed to query notification counts for $packageName: ${e.message}")
-            }
+            } catch (_: Exception) {}
         }
 
         val totalScreenTime = appStats?.totalTimeInForegroundMs ?: 0L
@@ -605,34 +717,43 @@ object UsageCalculator {
             hasRealUsageData = totalScreenTime > 0L,
             hasNotificationAccess = hasNotificationAccess,
             detectedSessions = sessions.reversed(),
-            appIcon = appIcon
+            appIcon = null
         )
     }
 
     private fun inferAppCategory(packageName: String, pm: PackageManager): String {
-        return try {
+        try {
             val appInfo = pm.getApplicationInfo(packageName, 0)
-            when (appInfo.category) {
-                ApplicationInfo.CATEGORY_SOCIAL -> "Social"
-                ApplicationInfo.CATEGORY_PRODUCTIVITY -> "Productivity"
-                ApplicationInfo.CATEGORY_GAME -> "Gaming"
-                ApplicationInfo.CATEGORY_VIDEO, ApplicationInfo.CATEGORY_AUDIO -> "Entertainment"
-                ApplicationInfo.CATEGORY_NEWS -> "Information"
-                ApplicationInfo.CATEGORY_MAPS -> "Navigation"
-                else -> {
-                    val lower = packageName.lowercase()
-                    when {
-                        lower.contains("whatsapp") || lower.contains("instagram") || lower.contains("facebook") || lower.contains("twitter") || lower.contains("reddit") || lower.contains("tiktok") -> "Social"
-                        lower.contains("youtube") || lower.contains("netflix") || lower.contains("spotify") || lower.contains("prime") -> "Entertainment"
-                        lower.contains("chrome") || lower.contains("browser") || lower.contains("gmail") || lower.contains("slack") || lower.contains("docs") -> "Productivity"
-                        lower.contains("duolingo") || lower.contains("coursera") || lower.contains("udemy") -> "Education"
-                        lower.contains("pesam") || lower.contains("efootball") || lower.contains("game") || lower.contains("pubg") -> "Gaming"
-                        else -> "General"
-                    }
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                val categoryInt = try {
+                    appInfo.category
+                } catch (_: Throwable) {
+                    ApplicationInfo.CATEGORY_UNDEFINED
+                }
+                when (categoryInt) {
+                    ApplicationInfo.CATEGORY_SOCIAL -> return "Social"
+                    ApplicationInfo.CATEGORY_PRODUCTIVITY -> return "Productivity"
+                    ApplicationInfo.CATEGORY_GAME -> return "Gaming"
+                    ApplicationInfo.CATEGORY_VIDEO, ApplicationInfo.CATEGORY_AUDIO -> return "Entertainment"
+                    ApplicationInfo.CATEGORY_NEWS -> return "Information"
+                    ApplicationInfo.CATEGORY_MAPS -> return "Navigation"
                 }
             }
-        } catch (e: Exception) {
-            "General"
+        } catch (_: Throwable) {}
+
+        val lower = packageName.lowercase()
+        return when {
+            lower.contains("whatsapp") || lower.contains("instagram") || lower.contains("facebook") ||
+                    lower.contains("twitter") || lower.contains("reddit") || lower.contains("tiktok") ||
+                    lower.contains("telegram") || lower.contains("messaging") -> "Social"
+            lower.contains("youtube") || lower.contains("netflix") || lower.contains("spotify") ||
+                    lower.contains("prime") || lower.contains("music") -> "Entertainment"
+            lower.contains("chrome") || lower.contains("browser") || lower.contains("gmail") ||
+                    lower.contains("slack") || lower.contains("docs") || lower.contains("notes") ||
+                    lower.contains("office") -> "Productivity"
+            lower.contains("duolingo") || lower.contains("coursera") || lower.contains("udemy") -> "Education"
+            lower.contains("game") || lower.contains("play") || lower.contains("pubg") || lower.contains("pes") -> "Gaming"
+            else -> "General"
         }
     }
 

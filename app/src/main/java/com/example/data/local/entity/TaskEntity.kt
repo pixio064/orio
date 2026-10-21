@@ -7,7 +7,8 @@ enum class TaskOutcome {
     PENDING,
     COMPLETED,
     MISSED,
-    SKIPPED
+    SKIPPED,
+    CARRIED
 }
 
 enum class TaskPriority {
@@ -45,4 +46,6 @@ data class TaskEntity(
     val subtasksJson: String = "[]",
     val locationOrNote: String = "",
     val createdAt: Long = System.currentTimeMillis()
-)
+) {
+    val isCompleted: Boolean get() = outcome == TaskOutcome.COMPLETED
+}
